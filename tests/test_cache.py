@@ -60,6 +60,19 @@ async def test_no_silent_replay_on_reconnect(tmp_path):
     await c.retire()
 
 
+async def test_retired_capture_refuses_new_writes_and_readers(tmp_path):
+    c = Capture(tmp_path)
+    reader = await c.open(0, None)
+    await c.retire(wait_for_disconnect=True)
+    with pytest.raises(RuntimeError, match="no longer writable"):
+        await c.append(b"stale audio")
+    with pytest.raises(LiveContentError) as error:
+        await c.open(0, None)
+    assert error.value.status == 410
+    await reader.aclose()
+    assert c.file.closed
+
+
 async def test_cache_bound(tmp_path):
     c = Capture(tmp_path, max_bytes=4)
     await c.append(b"abcd")

@@ -8,6 +8,8 @@ from kalinka_plugin_sdk.direct_playback import (
     TransportKind,
     TransportRequest,
 )
+from kalinka_server.live_content import serve
+from starlette.requests import Request
 
 from kalinka_plugin_spotify.ogg import InvalidOgg
 from kalinka_plugin_spotify.process import ProducerError
@@ -203,10 +205,13 @@ async def test_seek_discards_stale_read_ahead_and_uses_fresh_url(service, pages)
     reader = await old.open(0, None)
     old_track = service.hold.sources[-1][1]
     await service.event({"event": "seeked", "position_ms": 4000})
-    assert old.cancelled and service.hold.pauses == 1
-    with pytest.raises(OSError):
-        await reader.read(100)
+    assert old.retired and service.hold.pauses == 1
+    pending = asyncio.create_task(reader.read(100))
+    await asyncio.sleep(0.01)
+    assert not pending.done()  # Neither stale bytes nor an invented EOF.
     await reader.aclose()
+    with pytest.raises(OSError, match="cancelled"):
+        await pending
     assert old.file.closed
     await started(service, pages)
     assert service.capture.id != old.id
@@ -215,6 +220,53 @@ async def test_seek_discards_stale_read_ahead_and_uses_fresh_url(service, pages)
     service.on_state(PlaybackState(current_track=old_track, position=7000))
     assert service.capture.played_ms == 0
     assert service.direct.acquisitions == 1
+
+
+@pytest.mark.parametrize("asgi_version", ["2.0", "2.4"])
+@pytest.mark.parametrize("action", ["seeked", "track", "stopped", "disable"])
+async def test_retired_http_stream_waits_for_renderer_disconnect(
+    service, pages, asgi_version, action
+):
+    await started(service, pages)
+    capture = service.capture
+    response = await serve(
+        capture, "audio/ogg", Request({"type": "http", "method": "GET", "headers": []})
+    )
+    disconnected = asyncio.Event()
+    delivered = asyncio.Event()
+    messages = []
+
+    async def receive():
+        await disconnected.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        messages.append(message)
+        if message["type"] == "http.response.body":
+            delivered.set()
+
+    request_task = asyncio.create_task(
+        response(
+            {"type": "http", "asgi": {"spec_version": asgi_version}}, receive, send
+        )
+    )
+    try:
+        await asyncio.wait_for(delivered.wait(), 1)
+        if action == "disable":
+            await service.stop()
+        else:
+            await service.event({"event": action, "position_ms": 4000})
+        await asyncio.sleep(0.01)
+        assert not request_task.done()
+        assert capture.retired and not capture.file.closed
+        assert all(m.get("more_body", True) for m in messages)
+        disconnected.set()
+        await asyncio.wait_for(request_task, 1)
+        assert capture.file.closed and not capture.readers
+    finally:
+        disconnected.set()
+        request_task.cancel()
+        await asyncio.gather(request_task, return_exceptions=True)
 
 
 async def test_track_boundary_uses_new_metadata(service, pages):
