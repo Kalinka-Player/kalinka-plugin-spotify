@@ -6,7 +6,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from kalinka_plugin_sdk.module_health import ModuleHealthState
 from kalinka_server.config_model import KalinkaConfig
-from kalinka_server.config_overrides import apply_overrides_with_prefix, load_overrides
+from kalinka_server.config_overrides import (
+    apply_overrides_with_prefix,
+    find_one_shot_overrides,
+    load_overrides,
+)
 from kalinka_server.config_route import register_config_routes
 from kalinka_server.dynamic_field_registry import build_dynamic_field_registry
 from kalinka_server.options_registry import OptionsRegistry
@@ -14,8 +18,7 @@ from kalinka_server.options_registry import OptionsRegistry
 from kalinka_plugin_spotify import KalinkaPluginSpotify, SpotifyConfig
 
 
-def test_settings_schema_paths_can_be_enabled_and_survive_restart(tmp_path):
-    config = SpotifyConfig()
+def settings_app(tmp_path, config):
     plugin = KalinkaPluginSpotify()
     prepared = SimpleNamespace(
         plugin_context=SimpleNamespace(config=config),
@@ -37,6 +40,12 @@ def test_settings_schema_paths_can_be_enabled_and_survive_restart(tmp_path):
     app.state.overrides = {}
     app.state.overrides_file = str(tmp_path / "overrides.json")
     register_config_routes(app, KalinkaConfig(), modules)
+    return app
+
+
+def test_settings_schema_paths_can_be_enabled_and_survive_restart(tmp_path):
+    config = SpotifyConfig()
+    app = settings_app(tmp_path, config)
 
     with TestClient(app) as client:
         schema = client.get("/server/config/schema").json()
@@ -73,3 +82,28 @@ def test_settings_schema_paths_can_be_enabled_and_survive_restart(tmp_path):
     assert reloaded.name == "spotify"
     assert reloaded.enabled
     assert reloaded.device_name == "Living room Spotify"
+
+
+def test_unpair_is_a_one_shot_setting_the_server_resets(tmp_path):
+    config = SpotifyConfig()
+    app = settings_app(tmp_path, config)
+    path = "input_modules.spotify.unpair"
+
+    with TestClient(app) as client:
+        schema = client.get("/server/config/schema").json()
+        page = next(p for p in schema["pages"] if p["id"] == "modules")
+        [module] = page["modules"]
+        fields = {f["path"]: f for f in module["fields"]}
+        assert fields[path]["label"] == "Unpair Spotify account on next restart"
+        assert fields[path]["widget"] == "toggle"
+        assert client.get("/server/config").json()["values"][path] is False
+        payload = {"schema_version": "test", "changes": {path: True}}
+        saved = client.put("/server/config", json=payload)
+        assert saved.status_code == 200, saved.text
+
+    # At the next start the server resets the armed trigger before setup acts.
+    overrides = load_overrides(app.state.overrides_file)
+    armed = find_one_shot_overrides(
+        SpotifyConfig, "input_modules.spotify.", config, overrides
+    )
+    assert armed == [path]

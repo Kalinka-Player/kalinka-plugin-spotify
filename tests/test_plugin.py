@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from kalinka_plugin_sdk import paths
 
 from kalinka_plugin_spotify import KalinkaPluginSpotify, SpotifyConfig
 from kalinka_plugin_spotify.process import Librespot, ProducerError
@@ -17,6 +18,28 @@ async def test_disabled_by_default_has_no_process(tmp_path):
     assert (await plugin.get_state()).state.value == "disabled"
     assert await plugin.get_interface().get_content_info("unknown") is None
     await plugin.shutdown()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("unpair", [False, True])
+async def test_armed_unpair_forgets_only_the_saved_sign_in(
+    tmp_path, monkeypatch, enabled, unpair
+):
+    monkeypatch.setenv("KALINKA_PREFIX", str(tmp_path))
+    state = Path(paths.state_dir()) / "spotify"
+    state.mkdir(parents=True)
+    (state / "credentials.json").write_text("{}")
+    (state / "volume").write_text("50")
+    plugin = KalinkaPluginSpotify()
+    config = SpotifyConfig(
+        enabled=enabled, unpair=unpair, executable=str(tmp_path / "missing")
+    )
+    await plugin.setup(SimpleNamespace(config=config, direct_playback=object()))
+    try:
+        assert (state / "credentials.json").exists() is not unpair
+        assert (state / "volume").exists()
+    finally:
+        await plugin.shutdown()
 
 
 async def test_missing_binary(tmp_path):

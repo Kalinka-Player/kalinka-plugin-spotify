@@ -49,6 +49,7 @@ class OggParser:
         self.packet = bytearray()
         self.headers = 0
         self.rate = 0
+        self.max_page_ms = 0
         self.granule = 0
         self.ended = False
 
@@ -87,6 +88,7 @@ class OggParser:
                     raise InvalidOgg("Discontinuity without a new playback generation")
                 self.serial, self.sequence = serial, 0
                 self.headers, self.rate, self.granule = 0, 0, 0
+                self.max_page_ms = 0
                 self.packet.clear()
                 self.ended = False
             if self.serial != serial or sequence != self.sequence or self.ended:
@@ -108,14 +110,21 @@ class OggParser:
                         if self.headers == 0:
                             if len(self.packet) != 30:
                                 raise InvalidOgg("Invalid Vorbis identification header")
-                            version, channels, rate = struct.unpack_from(
-                                "<IBI", self.packet, 7
+                            version, channels, rate, blocksizes = struct.unpack_from(
+                                "<IBI12xB", self.packet, 7
                             )
                             if version != 0 or channels not in (1, 2) or rate != 44100:
                                 raise InvalidOgg(
                                     "librespot passthrough requires 44.1 kHz mono/stereo Vorbis"
                                 )
+                            short, long = 1 << (blocksizes & 15), 1 << (blocksizes >> 4)
+                            if not 64 <= short <= long <= 8192:
+                                raise InvalidOgg("Invalid Vorbis identification header")
                             self.rate = rate
+                            # A page completes at most 255 packets, each adding at
+                            # most half a long block. Silence reaches this limit:
+                            # Spotify's 2048-sample blocks give 5.9 s pages.
+                            self.max_page_ms = -(-255 * long // 2 * 1000 // rate)
                         self.headers += 1
                     self.packet.clear()
             if granule != 0xFFFFFFFFFFFFFFFF:

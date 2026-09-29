@@ -17,6 +17,11 @@ Spotify app ── Connect ── librespot 0.8.0 + small pipe bridge
                               └── plugin pacing / Spotify progress feedback
 ```
 
+Spotify streams at its highest Ogg/Vorbis quality, 320 kbps, falling back to
+160 or 96 kbps Vorbis when a track has no 320 kbps file. Spotify Lossless (FLAC)
+is unavailable: its keys are not served to librespot, and upstream has declined
+to support it.
+
 This plugin does not browse or index Spotify content, download a music library,
 transcode audio, or provide codec support. Kalinka already decodes Ogg/Vorbis.
 
@@ -79,10 +84,22 @@ Settings show the retry status. Discovery returns without a Kalinka server
 restart, but interrupted playback may need selecting Kalinka and pressing Play
 again in Spotify. Credentials and the selected renderer are preserved.
 
+Spotify sign-in failures also retry, with delays growing to at most five
+minutes, so the device returns by itself when Spotify recovers. This covers
+service errors such as a 503 from Spotify's token service. If Spotify rejects
+the saved sign-in itself, the plugin forgets it and the receiver restarts ready
+for pairing: select Kalinka in the Spotify app. Older bridge builds report both
+cases alike, so with them the plugin retries without forgetting the sign-in.
+
+To pair another account or pair again by hand, turn on **Unpair Spotify account
+on next restart** in the plugin settings and restart Kalinka. The saved sign-in
+is deleted once and the setting turns itself off; the receiver then waits for
+pairing, so select Kalinka in the Spotify app with a Premium account.
+
 Normal buffering, pause and queue handoff do not restart the receiver. Disabling
 the plugin or shutting down Kalinka cancels retries and stops its child. Missing
-or incompatible executables, startup failures and explicit authentication errors
-remain visible settings errors requiring correction. This watches process exit
+or incompatible executables and startup failures remain visible settings errors
+requiring correction. This watches process exit
 and session failures; it does not treat an idle receiver as an unresponsive one.
 
 The receiver and capability probe run outside the server's terminal process
@@ -170,22 +187,26 @@ skip or shutdown. Actual source failures still abort the response.
 
 The default media read-ahead budget is **2 seconds**, adjustable from 0.5–5
 seconds. Credit is based on actual renderer playback snapshots, polled once a
-second, with at most one second of extrapolation. One producer packet can be
-in flight beyond that budget; pages longer than 1.5 seconds are rejected.
-Default steady-state maximum lead is therefore approximately **4.5 seconds**,
-plus control/network scheduling. Produced bytes, HTTP-delivered bytes and
+second, with at most one second of extrapolation. One producer packet, a single
+Ogg page, can be in flight beyond that budget. Music pages span a fraction of a
+second, but silence packs up to 255 tiny Vorbis packets into one page: 5.9
+seconds for Spotify's 44.1 kHz streams. Packets spanning more media time than
+one page can carry are rejected. Default steady-state maximum lead is therefore
+about **3.5 seconds** during music and up to **9 seconds** across silence, plus
+control/network scheduling. Produced bytes, HTTP-delivered bytes and
 played milliseconds are tracked separately. The renderer's time also corrects
-Spotify's Connect clock once a second. Missing readers or feedback stop playback
+Spotify's Connect clock once a second. Missing readers or feedback pause playback
 after 30 seconds; pausing does not grant further credit.
 
-The capture is a private temporary file with a **32 MiB per-generation cap**
-(adjustable to 128 MiB). At most two generations can remain pinned across a
-seek, for a default **64 MiB disk cap**, and at most two readers per generation.
+The capture is a private temporary file with a **64 MiB per-generation cap**,
+about 28 minutes at 320 kbps (adjustable to 128 MiB). At most two generations can
+remain pinned across a seek, for a default **128 MiB disk cap**, and at most two
+readers per generation.
 Rapid seeks wait up to five seconds for an old reader to close before allocating
 another capture. If cleanup stalls, playback pauses and Spotify Connect stays
 available; press Play to retry. No earlier bytes are evicted or substituted.
-Exceeding a track's byte cap fails explicitly; very long tracks may need a larger
-setting. Files are unlinked temporary storage, outside music scanning, and close
+Exceeding a track's byte cap aborts its HTTP response and pauses Spotify at the
+last audible position; very long tracks may need a larger setting. Files are unlinked temporary storage, outside music scanning, and close
 after the last reader releases them.
 Memory holds bounded control messages, one compressed packet (max 1 MiB), Ogg
 framing state and small I/O chunks. It never accumulates a whole track in RAM.
@@ -212,7 +233,18 @@ position. Pending audio and old renderer callbacks cannot take the queue back.
 The native bridge drops the old decoder at handoff, then loads a fresh stream
 with Vorbis headers when playback resumes. Selecting another device in Spotify
 still transfers playback normally. Disabling the plugin and server shutdown
-stop and reap the owned process without restarting it. Fatal playback failures
+stop and reap the owned process without restarting it.
+
+Failures confined to one stream keep librespot and discovery running: invalid
+Ogg framing, cache limits or write errors, and a renderer that stops reading or
+reporting playback. The capture is retired and Spotify pauses at the last audible
+position, as after a renderer error. Once librespot confirms the suspension, the
+plugin resumes once, reloading the track there with fresh headers and a new HTTP
+resource. Each track gets one automatic retry; a repeat failure, such as a corrupt
+page at the same position, waits for Play. Renderer decode errors are not retried.
+Tracks Spotify reports as unavailable, including a failed preload of the next
+track, are logged and skipped by Spotify. Only receiver failures restart it:
+librespot exiting, broken control or audio framing, and failed controls. These
 clean up the old session before restarting discovery. The normal queue is retained and resumes only
 when explicitly played.
 

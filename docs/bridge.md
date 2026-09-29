@@ -3,6 +3,9 @@
 The patch extends the **existing librespot executable** with a private pipe
 bridge and a Spirc method for reporting external volume without a command echo.
 It keeps `--backend pipe --passthrough`; compressed bytes leave stdout unchanged.
+In bridge mode, file selection considers only Ogg Vorbis formats. Upstream's
+320 kbps preference lists MP3 before 160 kbps Vorbis, and the passthrough decoder
+cannot load MP3, so such a track would otherwise be skipped as unavailable.
 It is opt-in through an inherited private Unix socket FD.
 Without that FD, ordinary librespot playback is unchanged, apart from the two
 explicit offline verification options.
@@ -55,6 +58,10 @@ That makes the plugin time out waiting for bytes already announced by the bridge
 The socket writer is serialized. `loading`, `track`, and `seeked` increment the
 epoch and revoke outstanding credit. Other events include `paused`, `stopped`,
 `end`, `connected`, `disconnected`, and a fixed, credential-free `error.code`.
+If Spotify rejects the account login while starting Connect, the code is
+`authentication_failed`; other startup failures, such as a 503 from its token
+service, are `service_unavailable`. Builds that report this distinction add
+`"signin_errors": true` to their capability probe.
 `volume` carries Spotify's requested level as an integer from 0 to 65535:
 
 ```json
@@ -116,7 +123,11 @@ output warning, not a receiver failure: librespot and discovery remain alive,
 the failed capture is retired, and Play can acquire the newly selected renderer.
 Error callbacks do not replace the saved position or send zero progress. The
 warning clears after the new output reports playing; old-resource callbacks
-cannot suspend that stream. Shutdown still uses `disconnect`.
+cannot suspend that stream. Invalid Ogg data, capture failures and a stalled
+renderer suspend the same way: the plugin has read every announced byte, so
+stdout and the control lane stay aligned. For these, the plugin sends `resume`
+after the matching `suspended` marker, once per track URI; the player then loads
+the track afresh at the saved position. Shutdown still uses `disconnect`.
 Capability probes include `"reconnect": true` and `"suspend": true`; older bridge
 builds must be rebuilt.
 

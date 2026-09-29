@@ -20,7 +20,8 @@ renderer. They were **not run** by the offline test suite.
    A HEAD probe is safe. Confirm playback begins while capture is unfinished.
 5. Play for at least five minutes and through two track changes. Compare
    Spotify time, Kalinka time and audible track boundaries. Target a difference
-   within the default 4.5-second worst-case lead budget; record startup delay,
+   within the default lead budget (about 3.5 seconds, or 9 seconds across
+   silent passages); record startup delay,
    drift and transition gaps. No next track should audibly replace the previous
    one early. Confirm cache usage stays under its configured bounds.
 6. Pause in Spotify while buffered audio exists. Sound should pause promptly.

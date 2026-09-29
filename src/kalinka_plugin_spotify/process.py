@@ -15,6 +15,11 @@ class ProducerError(RuntimeError):
     pass
 
 
+def forget_credentials(state_directory: Path):
+    # Without saved credentials librespot waits for pairing in the app.
+    (state_directory / "credentials.json").unlink(missing_ok=True)
+
+
 class Librespot:
     def __init__(self, executable, device_name, state_directory: Path):
         self.executable = executable
@@ -24,6 +29,8 @@ class Librespot:
         self.reader = self.writer = None
         self.stderr_task = None
         self.send_lock = asyncio.Lock()
+        # Older bridges report every sign-in failure as authentication_failed.
+        self.signin_errors = False
 
     async def start(self):
         try:
@@ -57,6 +64,7 @@ class Librespot:
                 and capabilities.get("reconnect") is True
                 and capabilities.get("suspend") is True
             )
+            self.signin_errors = capabilities.get("signin_errors") is True
         except (ValueError, KeyError, TypeError):
             valid = False
         if not valid:
@@ -85,7 +93,7 @@ class Librespot:
                 "--name",
                 self.device_name,
                 "--bitrate",
-                "160",
+                "320",
                 "--cache",
                 str(self.state_directory),
                 "--disable-audio-cache",
@@ -131,6 +139,9 @@ class Librespot:
                 raise ProducerError("Invalid librespot control event") from None
             yield event
         raise ProducerError("librespot control connection closed.")
+
+    def forget_credentials(self):
+        forget_credentials(self.state_directory)
 
     async def wait(self):
         process = self.process
