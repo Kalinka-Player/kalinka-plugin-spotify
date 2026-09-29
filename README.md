@@ -60,6 +60,20 @@ Kalinka bridge or a build without passthrough fails with a settings error.
 Actual captured bytes must pass Ogg/Vorbis validation before playback starts.
 There is no PCM fallback.
 
+The plugin supervises its own receiver process. An unexpected exit, closed
+control connection or fatal playback-session failure releases the old renderer
+hold and starts a fresh receiver automatically. Retries wait 1, 2, 4, 8, 16 and
+then at most 30 seconds; one minute of stable operation resets the delay.
+Settings show the retry status. Discovery returns without a Kalinka server
+restart, but interrupted playback may need selecting Kalinka and pressing Play
+again in Spotify. Credentials and the selected renderer are preserved.
+
+Normal buffering, pause and queue handoff do not restart the receiver. Disabling
+the plugin or shutting down Kalinka cancels retries and stops its child. Missing
+or incompatible executables, startup failures and explicit authentication errors
+remain visible settings errors requiring correction. This watches process exit
+and session failures; it does not treat an idle receiver as an unresponsive one.
+
 If the selected renderer cannot play the stream, Spotify pauses and the plugin
 shows an output warning while keeping the Connect receiver available. Select a
 compatible renderer in Kalinka and press Play in Spotify to retry.
@@ -89,7 +103,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install build
 ./scripts/build_deb.sh
-sudo apt install ./kalinka-plugin-spotify_0.1.0_all.deb
+sudo apt install ./kalinka-plugin-spotify_0.1.2_all.deb
 ```
 
 `build_deb.sh` reads the version from the freshly built wheel and writes the
@@ -159,9 +173,12 @@ after 30 seconds; pausing does not grant further credit.
 The capture is a private temporary file with a **32 MiB per-generation cap**
 (adjustable to 128 MiB). At most two generations can remain pinned across a
 seek, for a default **64 MiB disk cap**, and at most two readers per generation.
-No earlier bytes are evicted or substituted. Exceeding a cap fails explicitly;
-very long tracks may need a larger setting. Files are unlinked temporary
-storage, outside music scanning, and close after the last reader releases them.
+Rapid seeks wait up to five seconds for an old reader to close before allocating
+another capture. If cleanup stalls, playback pauses and Spotify Connect stays
+available; press Play to retry. No earlier bytes are evicted or substituted.
+Exceeding a track's byte cap fails explicitly; very long tracks may need a larger
+setting. Files are unlinked temporary storage, outside music scanning, and close
+after the last reader releases them.
 Memory holds bounded control messages, one compressed packet (max 1 MiB), Ogg
 framing state and small I/O chunks. It never accumulates a whole track in RAM.
 
@@ -170,8 +187,8 @@ An unfinished HTTP GET is `200 audio/ogg`, `Cache-Control: no-store`, without
 including the renderer's bounded `Range: bytes=0-383999` probe, receives that
 same 200. Other unfinished ranges receive **409**, not
 an invented EOF/416. A second initial reader is also rejected, preventing a
-retry from silently replaying stale audio. Disable/re-enable the plugin and restart playback in Spotify to get
-a fresh resource after a broken HTTP connection. Completed, retained resources
+retry from silently replaying stale audio. After receiver recovery, restart
+playback in Spotify to get a fresh resource after a broken HTTP connection. Completed, retained resources
 support correct finite `206` ranges and `416 bytes */<final-size>`.
 
 Temporary lack of bytes is not EOF, including pause. Readers wait asynchronously
@@ -186,8 +203,9 @@ on Kalinka's currently selected renderer and resume at the last reported audible
 position. Pending audio and old renderer callbacks cannot take the queue back.
 The native bridge drops the old decoder at handoff, then loads a fresh stream
 with Vorbis headers when playback resumes. Selecting another device in Spotify
-still transfers playback normally. Disabling the plugin, server shutdown and fatal playback errors still
-stop and reap the owned process. The normal queue is retained and resumes only
+still transfers playback normally. Disabling the plugin and server shutdown
+stop and reap the owned process without restarting it. Fatal playback failures
+clean up the old session before restarting discovery. The normal queue is retained and resumes only
 when explicitly played.
 
 ## Current limits

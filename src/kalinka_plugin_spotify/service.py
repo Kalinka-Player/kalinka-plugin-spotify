@@ -46,10 +46,12 @@ class Service:
         budget_ms=2000,
         max_bytes=32 * 1024 * 1024,
         reader_timeout=30,
+        reader_close_timeout=5,
     ):
         self.direct, self.producer = direct, producer
         self.budget_ms, self.max_bytes = budget_ms, max_bytes
         self.reader_timeout = reader_timeout
+        self.reader_close_timeout = reader_close_timeout
         cache_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         cache_directory.chmod(0o700)
         self.directory = tempfile.TemporaryDirectory(
@@ -62,6 +64,8 @@ class Service:
         self.metadata = {}
         self.hold = None
         self.task = self.pacer = None
+        self.exit_watcher = None
+        self.restartable = False
         self.cleanup_task = None
         self.commands = set()
         self.pending = None
@@ -97,6 +101,8 @@ class Service:
         stage = "starting librespot"
         try:
             await self.producer.start()
+            self.restartable = True
+            self.exit_watcher = asyncio.create_task(self._watch_producer())
             self.pacer = asyncio.create_task(self._pace())
             async for event in self.producer.events():
                 if self.closed:
@@ -110,7 +116,7 @@ class Service:
             self.error = (
                 str(exc)
                 if isinstance(exc, (ProducerError, InvalidOgg, CaptureError))
-                else "Spotify playback failed; disable/re-enable to reconnect."
+                else "Spotify playback failed."
             )
             self.status = self.error
             logger.error("Spotify Connect: %s", self.error)
@@ -127,6 +133,15 @@ class Service:
             )
         finally:
             await self._cleanup()
+
+    async def _watch_producer(self):
+        returncode = await self.producer.wait()
+        if self.closed:
+            return
+        self.error = self.status = f"librespot exited (status {returncode})."
+        logger.error("Spotify Connect: %s", self.error)
+        if self.task:
+            self.task.cancel()
 
     async def _invalidate(self):
         self.generation += 1
@@ -188,11 +203,14 @@ class Service:
                 return
         self.bridge_epoch = event.get("epoch", self.bridge_epoch)
         if kind == "error":
+            if event.get("code") == "authentication_failed":
+                self.restartable = False
             raise ProducerError(
                 ERRORS.get(event.get("code"), "Spotify process reported an error.")
             )
         if kind == "ready":
             if event.get("protocol") != 1:
+                self.restartable = False
                 raise ProducerError("Unsupported librespot control protocol")
         elif kind == "connected":
             self.status = "Connected; Spotify manages the queue"
@@ -241,11 +259,8 @@ class Service:
         if self.capture is None:
             if not self.metadata:
                 raise InvalidOgg("Audio arrived without track metadata")
-            self.captures = {c for c in self.captures if not c.file.closed}
-            if len(self.captures) >= 2:
-                raise ProducerError(
-                    "Previous renderer readers still hold the playback cache; reconnect Spotify."
-                )
+            if not await self._wait_for_capture_slot():
+                return
             self.capture = Capture(
                 Path(self.directory.name),
                 max_bytes=self.max_bytes,
@@ -297,6 +312,34 @@ class Service:
             return
         self.pending = (event["id"], self.generation)
         self.changed.set()
+
+    async def _wait_for_capture_slot(self):
+        self.captures = {c for c in self.captures if not c.file.closed}
+        if len(self.captures) < 2:
+            return True
+        # Rapid seeks can overtake the renderer's HTTP disconnects. Hold back
+        # the next packet's credit until either retired file is unpinned, rather
+        # than exceeding the cache bound or shutting down the Connect receiver.
+        closing = [asyncio.create_task(c.wait_closed()) for c in self.captures]
+        try:
+            await asyncio.wait(
+                closing,
+                timeout=self.reader_close_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in closing:
+                task.cancel()
+            await asyncio.gather(*closing, return_exceptions=True)
+        self.captures = {c for c in self.captures if not c.file.closed}
+        if len(self.captures) >= 2:
+            logger.warning("Spotify renderer streams did not close; pausing playback")
+            self._pause_for_output_error(
+                "Renderer is still closing previous Spotify streams; "
+                "press Play in Spotify to retry"
+            )
+            return False
+        return True
 
     async def _pace(self):
         try:
@@ -435,6 +478,8 @@ class Service:
     def on_revoked(self, reason):
         if self.closed:
             return
+        if reason == RevokeReason.SHUTDOWN:
+            self.restartable = False
         if reason is not None and reason != RevokeReason.SHUTDOWN and not self.error:
             if self.awaiting_play:
                 return
@@ -482,9 +527,7 @@ class Service:
                     "suspend", id=handoff_id, position_ms=position_ms
                 )
         except Exception:
-            self.error = (
-                "Spotify could not release playback; disable/re-enable to reconnect."
-            )
+            self.error = "Spotify could not release playback."
             logger.error(self.error)
             self.on_revoked(None)
 
@@ -556,6 +599,9 @@ class Service:
 
     async def _close_resources(self):
         self.closed = True
+        if self.exit_watcher:
+            self.exit_watcher.cancel()
+            await asyncio.gather(self.exit_watcher, return_exceptions=True)
         if self.release_task:
             self.release_task.cancel()
             await asyncio.gather(self.release_task, return_exceptions=True)

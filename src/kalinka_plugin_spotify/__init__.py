@@ -14,6 +14,7 @@ from pydantic import Field
 
 from .process import Librespot
 from .service import Service
+from .supervisor import Supervisor
 
 
 class SpotifyConfig(ModuleConfig):
@@ -103,15 +104,18 @@ class KalinkaPluginSpotify(InputModulePlugin):
             raise RuntimeError(
                 "Spotify Connect requires Kalinka direct playback and SDK 3.5"
             )
-        producer = Librespot(
-            config.executable, config.device_name, Path(paths.state_dir()) / "spotify"
-        )
-        self.service = Service(
-            context.direct_playback,
-            producer,
-            Path(paths.cache_dir()) / "spotify",
-            budget_ms=config.read_ahead_ms,
-            max_bytes=config.cache_limit_mib * 1024 * 1024,
+        self.service = Supervisor(
+            lambda: Service(
+                context.direct_playback,
+                Librespot(
+                    config.executable,
+                    config.device_name,
+                    Path(paths.state_dir()) / "spotify",
+                ),
+                Path(paths.cache_dir()) / "spotify",
+                budget_ms=config.read_ahead_ms,
+                max_bytes=config.cache_limit_mib * 1024 * 1024,
+            )
         )
         self.service.start()
 
@@ -133,7 +137,7 @@ class KalinkaPluginSpotify(InputModulePlugin):
             )
         return ModuleState(
             state=ModuleHealthState.WARNING
-            if self.service and self.service.closed
+            if self.service and (self.service.closed or self.service.retrying)
             else ModuleHealthState.READY,
             message=await self.resolve_dynamic_field("connect_status"),
         )

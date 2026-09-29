@@ -24,6 +24,7 @@ class Producer:
         self.starts = 0
         self.incoming = asyncio.Queue()
         self.audio_reads = []
+        self.exited = asyncio.Future()
 
     async def start(self):
         self.starts += 1
@@ -42,6 +43,9 @@ class Producer:
 
     async def stop(self):
         self.stopped = True
+
+    async def wait(self):
+        return await self.exited
 
 
 class Hold:
@@ -573,14 +577,157 @@ async def test_useful_process_failures(service, code, text):
         await service.event({"event": "error", "code": code})
 
 
-async def test_total_disk_is_bounded_across_slow_retired_readers(service, pages):
+@pytest.mark.parametrize("asgi_version", ["2.0", "2.4"])
+@pytest.mark.parametrize("disconnect_index", [0, 1])
+async def test_seek_waits_for_either_retired_http_reader(
+    service, pages, asgi_version, disconnect_index
+):
+    requests = []
+    pending = None
+    try:
+        for position in (1000, 6000):
+            await started(service, pages)
+            capture = service.capture
+            response = await serve(
+                capture,
+                "audio/ogg",
+                Request({"type": "http", "method": "GET", "headers": []}),
+            )
+            disconnected, delivered = asyncio.Event(), asyncio.Event()
+            messages = []
+
+            async def receive(disconnected=disconnected):
+                await disconnected.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(message, messages=messages, delivered=delivered):
+                messages.append(message)
+                if message["type"] == "http.response.body":
+                    delivered.set()
+
+            task = asyncio.create_task(
+                response(
+                    {"type": "http", "asgi": {"spec_version": asgi_version}},
+                    receive,
+                    send,
+                )
+            )
+            requests.append((disconnected, task, capture, messages))
+            await asyncio.wait_for(delivered.wait(), 1)
+            await service.event({"event": "seeked", "position_ms": position})
+
+        pending = asyncio.create_task(feed(service, pages[0], 100))
+        await asyncio.sleep(0.02)
+        assert not pending.done()
+        assert service.capture is None
+        assert len(service.captures) == 2
+        assert not service.closed and service.error is None
+
+        disconnected, task, released, _ = requests[disconnect_index]
+        disconnected.set()
+        await asyncio.wait_for(task, 1)
+        await asyncio.wait_for(pending, 1)
+        assert released.file.closed
+        assert service.capture.offset_ms == 6000
+        assert len(service.captures) == 2
+        assert not requests[1 - disconnect_index][1].done()
+        for _, _, _, messages in requests:
+            assert all(message.get("more_body", True) for message in messages)
+        for i, page in enumerate(pages[1:], 101):
+            await feed(service, page, i)
+            if service.play_started:
+                break
+        assert service.play_started and service.direct.acquisitions == 1
+        assert service.hold.sources[-1][0].timeline_offset_ms == 6000
+        assert not service.producer.stopped and service.error is None
+    finally:
+        if pending:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        for disconnected, _, _, _ in requests:
+            disconnected.set()
+        await asyncio.gather(*(task for _, task, _, _ in requests))
+
+
+async def test_stalled_retired_readers_pause_without_losing_connect(service, pages):
+    service.reader_close_timeout = 0.02
+    service.start()
+    await wait_until(lambda: service.producer.starts == 1)
     readers = []
     for _ in range(2):
         await started(service, pages)
         readers.append(await service.capture.open(0, None))
         await service.event({"event": "seeked", "position_ms": 0})
-    with pytest.raises(ProducerError, match="Previous renderer readers"):
-        await feed(service, pages[0], 100)
+    await feed(service, pages[0], 100)
+    await asyncio.wait_for(service.release_task, 1)
+    assert service.awaiting_play and service.output_error
+    assert service.error is None and not service.closed
+    assert not service.task.done() and not service.producer.stopped
+    assert service.capture is None and len(service.captures) == 2
+    assert all(not c.file.closed for c in service.captures)
+    assert any(op == "suspend" for op, _ in service.producer.commands)
+    assert not any(op == "disconnect" for op, _ in service.producer.commands)
+    for reader in readers:
+        await reader.aclose()
+    assert all(c.file.closed for c in service.captures)
+    await service.event({"event": "suspended", "id": service.suspending})
+    await service.event({"event": "track", "title": "Retry", "duration_ms": 8000})
+    await service.event({"event": "playing", "position_ms": 4000})
+    await started(service, pages)
+    assert service.play_started and not service.awaiting_play
+    assert service.capture.offset_ms == 4000
+    assert service.producer.starts == 1 and not service.producer.stopped
+    assert service.direct.acquisitions == 2
+
+
+async def test_repeated_fast_seeks_keep_cache_bounded(service, pages):
+    service.start()
+    await wait_until(lambda: service.producer.starts == 1)
+    readers = []
+    await started(service, pages)
+    try:
+        for index in range(20):
+            readers.append(await service.capture.open(0, None))
+            position = 1000 if index % 2 else 6000
+            await service.event({"event": "seeked", "position_ms": position})
+            replacement = asyncio.create_task(started(service, pages))
+            try:
+                if len(readers) == 2:
+                    await asyncio.sleep(0.005)
+                    assert not replacement.done()
+                    await readers.pop(0).aclose()
+                await asyncio.wait_for(replacement, 1)
+            finally:
+                replacement.cancel()
+                await asyncio.gather(replacement, return_exceptions=True)
+            assert len(service.captures) <= 2
+            assert service.capture.offset_ms == position
+            assert service.error is None and not service.closed
+            assert service.play_started
+        assert service.producer.starts == 1 and not service.producer.stopped
+        assert service.direct.acquisitions == 1
+    finally:
+        for reader in readers:
+            await reader.aclose()
+
+
+async def test_disable_interrupts_waiting_for_retired_readers(service, pages):
+    service.start()
+    await wait_until(lambda: service.producer.starts == 1)
+    readers = []
+    for _ in range(2):
+        await started(service, pages)
+        readers.append(await service.capture.open(0, None))
+        await service.event({"event": "seeked", "position_ms": 0})
+    service.producer.data = pages[0].data
+    await service.producer.incoming.put(
+        {"event": "packet", "length": len(pages[0].data), "id": 100}
+    )
+    await asyncio.sleep(0.02)
+    assert service.error is None and not service.task.done()
+    await asyncio.wait_for(service.stop(), 0.5)
+    assert service.closed and service.producer.stopped
+    assert service.task.done() and service.error is None
     for reader in readers:
         await reader.aclose()
     assert all(c.file.closed for c in service.captures)

@@ -27,6 +27,10 @@ Removal uninstalls the plugin from /opt/kalinka/venv using Kalinka's standard
 prerm hook. Upgrades leave the existing installation in place until bootstrap
 installs the new wheel. The package does not delete account credentials or
 configuration, and it does not install a separate Spotify systemd service.
+The plugin supervises its owned librespot process and restarts it after an
+unexpected exit, with retry delays capped at 30 seconds. Disabling the plugin
+or shutting down the server cancels retries. An interrupted Spotify session
+may need selecting Kalinka and pressing Play again after discovery returns.
 
 Build and operation instructions:
 https://github.com/Kalinka-Player/kalinka-plugin-spotify

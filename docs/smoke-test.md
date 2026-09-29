@@ -61,9 +61,13 @@ renderer. They were **not run** by the offline test suite.
    in Olivia Dean Radio stopped on the phone until the affected track was
    unhidden. Initial hidden-song skipping was subsequently confirmed; the
    consecutive-hidden-song cases below still need verification.
-10. Disable during pause and during active capture. Repeat after killing the
-    plugin-owned child. Confirm useful settings errors, no lingering child,
-    released readers and no retained audio files. Finally replay local FLAC,
+10. Kill only the plugin-owned librespot child while idle, then while playing.
+    Confirm a new child advertises the same name without changing the server PID;
+    old playback readers/holds must close, and new playback must use a fresh URL.
+    Repeat failures to check the increasing retry delay and visible retry status.
+    Disable during retry, pause and active capture. Confirm no further child is
+    spawned, no lingering child, released readers and no retained audio files.
+    Finally replay local FLAC,
     MP3 and Ogg on the same renderer.
 
 Record versions, device models, network topology, measured drift/latency, and

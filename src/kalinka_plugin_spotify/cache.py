@@ -94,6 +94,10 @@ class Capture:
         if self.retired and not self.readers:
             self.file.close()
 
+    async def wait_closed(self):
+        async with self.condition:
+            await self.condition.wait_for(lambda: self.file.closed)
+
     async def open(self, start, end):
         async with self.condition:
             if self.retired or self.failure:
