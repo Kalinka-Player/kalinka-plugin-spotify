@@ -149,7 +149,7 @@ async def test_disable_during_backoff_does_not_spawn_another_process(receiver):
     assert len(sessions) == 1 and sessions[0].producer.stopped
 
 
-@pytest.mark.parametrize("action", ["stop", "shutdown", "authentication", "protocol"])
+@pytest.mark.parametrize("action", ["stop", "shutdown", "protocol"])
 async def test_intentional_stop_and_permanent_errors_do_not_restart(receiver, action):
     supervisor, sessions = receiver
     if action == "stop":
@@ -157,17 +157,62 @@ async def test_intentional_stop_and_permanent_errors_do_not_restart(receiver, ac
     elif action == "shutdown":
         sessions[0].on_revoked(RevokeReason.SHUTDOWN)
     else:
-        event = (
-            {"event": "error", "code": "authentication_failed"}
-            if action == "authentication"
-            else {"event": "ready", "protocol": 999}
-        )
-        sessions[0].producer.incoming.put_nowait(event)
+        sessions[0].producer.incoming.put_nowait({"event": "ready", "protocol": 999})
     await wait_until(lambda: supervisor.closed)
     await asyncio.sleep(0.03)
     assert len(sessions) == 1 and sessions[0].producer.stopped
-    if action in ("authentication", "protocol"):
+    if action == "protocol":
         assert supervisor.error
+
+
+@pytest.mark.parametrize(
+    "code, signin_errors",
+    [
+        # 503s from Spotify's token service, as reported by current bridges.
+        ("service_unavailable", True),
+        # Older bridges report every sign-in failure this way.
+        ("authentication_failed", False),
+    ],
+)
+async def test_signin_failures_keep_retrying_with_slow_backoff(
+    receiver, caplog, code, signin_errors
+):
+    supervisor, sessions = receiver
+    supervisor.max_signin_retry_delay = 0.08
+    for index in range(5):
+        await wait_until(
+            lambda: len(sessions) > index and sessions[index].producer.starts
+        )
+        sessions[index].producer.signin_errors = signin_errors
+        sessions[index].producer.incoming.put_nowait({"event": "error", "code": code})
+        await wait_until(lambda: len(sessions) > index + 1 or supervisor.retrying)
+        if index == 0:
+            assert "sign-in" in supervisor.status and "retrying" in supervisor.status
+            assert supervisor.error is None
+        await wait_until(lambda: len(sessions) > index + 1)
+    delays = [
+        float(record.message.rsplit(" ", 2)[1])
+        for record in caplog.records
+        if record.name.endswith("supervisor")
+    ]
+    # The ceiling exceeds max_retry_delay (0.04) used for other failures.
+    assert delays == [0.01, 0.02, 0.04, 0.08, 0.08]
+    assert not any(s.producer.credentials_forgotten for s in sessions)
+    assert not supervisor.closed
+
+
+async def test_rejected_signin_forgets_credentials_and_restarts_for_pairing(
+    receiver,
+):
+    supervisor, sessions = receiver
+    sessions[0].producer.signin_errors = True
+    sessions[0].producer.incoming.put_nowait(
+        {"event": "error", "code": "authentication_failed"}
+    )
+    await wait_until(lambda: len(sessions) == 2 and sessions[1].producer.starts)
+    assert sessions[0].producer.credentials_forgotten
+    assert "pair it again" in sessions[0].error
+    assert supervisor.error is None and not supervisor.closed
 
 
 @pytest.mark.parametrize("state", ["idle", "paused", "handoff", "buffering"])
@@ -196,7 +241,10 @@ def native_receiver(tmp_path):
         + textwrap.dedent("""
         import json, os, socket, sys
         if '--kalinka-capabilities' in sys.argv:
-            print(json.dumps(dict(protocol=1, librespot='0.8.0', passthrough=True, pipe=True, volume=True, reconnect=True, suspend=True)))
+            caps = dict(protocol=1, librespot='0.8.0', passthrough=True, pipe=True, volume=True, reconnect=True, suspend=True)
+            if os.environ.get('FAKE_SIGNIN_ERRORS'):
+                caps['signin_errors'] = True
+            print(json.dumps(caps))
             raise SystemExit
         control = socket.socket(fileno=int(os.environ['KALINKA_CONTROL_FD']))
         control.sendall(b'{"event":"ready","protocol":1}\\n')
@@ -251,6 +299,27 @@ async def test_actual_subprocess_exit_is_reaped_and_replaced(
         await supervisor.stop()
     assert all(s.producer.process is None for s in sessions)
     assert supervisor.task.done()
+
+
+@pytest.mark.parametrize("signin_errors", [False, True])
+async def test_bridge_sign_in_capability_and_credential_reset(
+    tmp_path, native_receiver, monkeypatch, signin_errors
+):
+    if signin_errors:
+        monkeypatch.setenv("FAKE_SIGNIN_ERRORS", "1")
+    state = tmp_path / "credentials"
+    producer = Librespot(str(native_receiver), "test", state)
+    await producer.start()
+    try:
+        assert producer.signin_errors is signin_errors
+        (state / "credentials.json").write_text("{}")
+        (state / "volume").write_text("50")
+        producer.forget_credentials()
+        assert not (state / "credentials.json").exists()
+        assert (state / "volume").exists()
+        producer.forget_credentials()  # Already absent.
+    finally:
+        await asyncio.wait_for(producer.stop(), 4)
 
 
 async def test_immediate_disable_never_starts_child(tmp_path, native_receiver):

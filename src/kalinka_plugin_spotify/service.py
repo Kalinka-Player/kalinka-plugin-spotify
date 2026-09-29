@@ -29,11 +29,16 @@ from .process import ProducerError
 logger = logging.getLogger(__name__)
 
 ERRORS = {
-    "authentication_failed": "Spotify authentication failed; pair again from the Spotify app using a Premium account.",
+    "authentication_failed": "Spotify sign-in failed",
+    "service_unavailable": "Spotify sign-in is temporarily unavailable",
     "track_unavailable": "Spotify could not load this track as Ogg/Vorbis.",
     "incompatible_format": "Spotify supplied an incompatible audio format; only Ogg/Vorbis passthrough is supported.",
     "control_failed": "Spotify did not accept a playback control.",
 }
+SIGNIN_REJECTED = (
+    "Spotify rejected the saved sign-in; select this device in the Spotify app "
+    "to pair it again with a Premium account"
+)
 
 
 class Service:
@@ -66,6 +71,7 @@ class Service:
         self.task = self.pacer = None
         self.exit_watcher = None
         self.restartable = False
+        self.signin_failed = False
         self.cleanup_task = None
         self.commands = set()
         self.pending = None
@@ -219,16 +225,22 @@ class Service:
                 return
         self.bridge_epoch = event.get("epoch", self.bridge_epoch)
         if kind == "error":
-            if event.get("code") == "track_unavailable":
+            code = event.get("code")
+            if code == "track_unavailable":
                 # Spirc marks the track unavailable and skips it. This is also
                 # reported when preloading the next track fails mid-song.
                 logger.warning("%s", ERRORS["track_unavailable"])
                 return
-            if event.get("code") == "authentication_failed":
-                self.restartable = False
-            raise ProducerError(
-                ERRORS.get(event.get("code"), "Spotify process reported an error.")
-            )
+            if code in ("authentication_failed", "service_unavailable"):
+                # Spotify can refuse sign-in for hours, e.g. with a 503 from its
+                # token service. Keep retrying so the device returns by itself.
+                self.signin_failed = True
+                if code == "authentication_failed" and self.producer.signin_errors:
+                    # This bridge reports only a rejected account login here.
+                    # Forget it; the restarted receiver then waits for pairing.
+                    self.producer.forget_credentials()
+                    raise ProducerError(SIGNIN_REJECTED)
+            raise ProducerError(ERRORS.get(code, "Spotify process reported an error."))
         if kind == "ready":
             if event.get("protocol") != 1:
                 self.restartable = False

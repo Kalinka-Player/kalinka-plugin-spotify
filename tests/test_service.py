@@ -26,6 +26,8 @@ class Producer:
         self.incoming = asyncio.Queue()
         self.audio_reads = []
         self.exited = asyncio.Future()
+        self.signin_errors = False
+        self.credentials_forgotten = False
 
     async def start(self):
         self.starts += 1
@@ -44,6 +46,9 @@ class Producer:
 
     async def stop(self):
         self.stopped = True
+
+    def forget_credentials(self):
+        self.credentials_forgotten = True
 
     async def wait(self):
         return await self.exited
@@ -680,7 +685,8 @@ async def test_each_track_gets_its_own_automatic_retry(service, pages):
 @pytest.mark.parametrize(
     "code, text",
     [
-        ("authentication_failed", "authentication"),
+        ("authentication_failed", "sign-in failed"),
+        ("service_unavailable", "temporarily unavailable"),
         ("incompatible_format", "incompatible"),
     ],
 )

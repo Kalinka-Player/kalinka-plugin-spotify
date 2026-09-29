@@ -2020,7 +2020,7 @@ index 9c09be5..4b94553 100644
              PlayerCommand::AddEventSender(_) => f.debug_tuple("AddEventSender").finish(),
              PlayerCommand::SetSinkEventCallback(_) => {
 diff --git a/src/main.rs b/src/main.rs
-index fb85803..13e8b77 100644
+index fb85803..868bb31 100644
 --- a/src/main.rs
 +++ b/src/main.rs
 @@ -1879,6 +1879,21 @@ async fn set_env_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
@@ -2029,7 +2029,7 @@ index fb85803..13e8b77 100644
  async fn main() {
 +    if env::args().any(|a| a == "--kalinka-capabilities") {
 +        println!(
-+            "{{\"protocol\":1,\"librespot\":\"0.8.0\",\"passthrough\":{},\"pipe\":true,\"volume\":true,\"reconnect\":true,\"suspend\":true}}",
++            "{{\"protocol\":1,\"librespot\":\"0.8.0\",\"passthrough\":{},\"pipe\":true,\"volume\":true,\"reconnect\":true,\"suspend\":true,\"signin_errors\":true}}",
 +            cfg!(feature = "passthrough-decoder")
 +        );
 +        return;
@@ -2078,11 +2078,18 @@ index fb85803..13e8b77 100644
              credentials = async {
                  match discovery.as_mut() {
                      Some(d) => d.next().await,
-@@ -2054,6 +2095,7 @@ async fn main() {
+@@ -2054,6 +2095,14 @@ async fn main() {
                                                                  mixer.clone()).await {
                      Ok((spirc_, spirc_task_)) => (spirc_, spirc_task_),
                      Err(e) => {
-+                        librespot::playback::kalinka::emit(serde_json::json!({"event":"error", "code":"authentication_failed"}));
++                        // Only a rejected account login invalidates saved credentials.
++                        // Service errors, such as a 503 from login5, are worth retrying.
++                        use librespot::core::error::ErrorKind;
++                        let code = match e.kind {
++                            ErrorKind::PermissionDenied | ErrorKind::Unauthenticated => "authentication_failed",
++                            _ => "service_unavailable",
++                        };
++                        librespot::playback::kalinka::emit(serde_json::json!({"event":"error", "code":code}));
                          error!("could not initialize spirc: {e}");
                          exit(1);
                      }

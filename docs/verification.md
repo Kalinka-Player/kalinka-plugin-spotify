@@ -456,3 +456,23 @@ Connect tests passed. Lossless FLAC was not attempted: librespot cannot obtain
 its keys, and upstream has declined to support it
 ([librespot#1583](https://github.com/librespot-org/librespot/issues/1583)).
 Playback at 320 kbps has not yet been checked with a live account.
+
+On 2026-09-29 from 14:47, both test receivers disappeared from Spotify and
+stayed gone. A manual run showed that the account login succeeded, then
+`login5.spotify.com/v3/login` returned 503, so Connect could not start. The
+bridge reported every such startup failure as `authentication_failed`, which the
+plugin treated as permanent. The receiver needed a manual restart even after
+Spotify recovered. With genuinely rejected credentials it could not recover at
+all, because librespot retried the saved sign-in before discovery.
+
+The bridge now reports a rejected account login (`PermissionDenied` or
+`Unauthenticated`) as `authentication_failed` and other Connect startup failures
+as `service_unavailable`, and advertises `"signin_errors": true`. The plugin
+retries all sign-in failures, with backoff up to five minutes. On a rejection
+reported by such a build, it deletes `credentials.json` so the restarted
+receiver waits for pairing. With older builds it retries without deleting
+anything. Run through the plugin's `Librespot` wrapper during the outage, the
+rebuilt binary reported `service_unavailable` and kept the credentials. The
+regenerated patch applies to a pristine checkout, the offline verifier passed,
+and tests cover both bridge generations, the slower backoff and credential
+removal.

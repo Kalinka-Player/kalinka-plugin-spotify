@@ -84,10 +84,17 @@ Settings show the retry status. Discovery returns without a Kalinka server
 restart, but interrupted playback may need selecting Kalinka and pressing Play
 again in Spotify. Credentials and the selected renderer are preserved.
 
+Spotify sign-in failures also retry, with delays growing to at most five
+minutes, so the device returns by itself when Spotify recovers. This covers
+service errors such as a 503 from Spotify's token service. If Spotify rejects
+the saved sign-in itself, the plugin forgets it and the receiver restarts ready
+for pairing: select Kalinka in the Spotify app. Older bridge builds report both
+cases alike, so with them the plugin retries without forgetting the sign-in.
+
 Normal buffering, pause and queue handoff do not restart the receiver. Disabling
 the plugin or shutting down Kalinka cancels retries and stops its child. Missing
-or incompatible executables, startup failures and explicit authentication errors
-remain visible settings errors requiring correction. This watches process exit
+or incompatible executables and startup failures remain visible settings errors
+requiring correction. This watches process exit
 and session failures; it does not treat an idle receiver as an unresponsive one.
 
 The receiver and capability probe run outside the server's terminal process

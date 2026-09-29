@@ -58,6 +58,10 @@ That makes the plugin time out waiting for bytes already announced by the bridge
 The socket writer is serialized. `loading`, `track`, and `seeked` increment the
 epoch and revoke outstanding credit. Other events include `paused`, `stopped`,
 `end`, `connected`, `disconnected`, and a fixed, credential-free `error.code`.
+If Spotify rejects the account login while starting Connect, the code is
+`authentication_failed`; other startup failures, such as a 503 from its token
+service, are `service_unavailable`. Builds that report this distinction add
+`"signin_errors": true` to their capability probe.
 `volume` carries Spotify's requested level as an integer from 0 to 65535:
 
 ```json

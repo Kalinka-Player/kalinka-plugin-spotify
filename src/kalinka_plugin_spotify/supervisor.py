@@ -9,11 +9,19 @@ logger = logging.getLogger(__name__)
 
 class Supervisor:
     def __init__(
-        self, create_service, *, retry_delay=1, max_retry_delay=30, stable_after=60
+        self,
+        create_service,
+        *,
+        retry_delay=1,
+        max_retry_delay=30,
+        max_signin_retry_delay=300,
+        stable_after=60,
     ):
         self.create_service = create_service
         self.retry_delay = retry_delay
         self.max_retry_delay = max_retry_delay
+        # Spotify can refuse sign-in for hours; poll it gently until it returns.
+        self.max_signin_retry_delay = max_signin_retry_delay
         self.stable_after = stable_after
         self.session = None
         self.task = None
@@ -66,10 +74,18 @@ class Supervisor:
                 if time.monotonic() - started >= self.stable_after:
                     delay = self.retry_delay
                 self.retrying = True
-                self.retry_status = f"Spotify Connect restarting in {delay:g} seconds"
+                signin = self.session.signin_failed
+                self.retry_status = (
+                    f"{self.session.error}; retrying in {delay:g} seconds"
+                    if signin
+                    else f"Spotify Connect restarting in {delay:g} seconds"
+                )
                 logger.warning("%s", self.retry_status)
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, self.max_retry_delay)
+                ceiling = (
+                    self.max_signin_retry_delay if signin else self.max_retry_delay
+                )
+                delay = min(delay * 2, ceiling)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

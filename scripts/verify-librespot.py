@@ -77,6 +77,7 @@ assert json.loads(cap) == {
     "volume": True,
     "reconnect": True,
     "suspend": True,
+    "signin_errors": True,
 }
 for credit_gated in (False, True):
     for seek in (None, 4000):
