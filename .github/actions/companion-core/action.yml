@@ -1,0 +1,13 @@
+name: Companion Kalinka core
+description: Check out the pinned Kalinka core into ./core with the SDK 3.5 companion patch applied.
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: Kalinka-Player/KalinkaPlayer
+        ref: 6162c0b0625bb41c2cb72d9c0509d6e0585b6057
+        path: core
+        fetch-depth: 0
+    - shell: bash
+      run: git -C core apply ../patches/kalinka-core-3.5.patch

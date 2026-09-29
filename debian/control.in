@@ -2,12 +2,12 @@ Package: kalinka-plugin-spotify
 Version: @VERSION@
 Section: python
 Priority: optional
-Architecture: all
-Depends: kalinka-server, kalinka-plugin-sdk (>= 3.5), kalinka-plugin-sdk (<< 4), python3 (>= 3.11), ca-certificates
+Architecture: @ARCH@
+Depends: kalinka-server, kalinka-plugin-sdk (>= 3.5), kalinka-plugin-sdk (<< 4), python3 (>= 3.11), ca-certificates, @SHLIBS_DEPENDS@
 Maintainer: Dmitry Savin <envelsavinds@gmail.com>
 Homepage: https://github.com/Kalinka-Player/kalinka-plugin-spotify
 Description: Spotify Connect input for Kalinka Music Player
  Server-side Spotify Connect plugin that captures compressed Ogg/Vorbis audio
  and serves it to Kalinka's selected renderer. Spotify controls the queue.
- Requires a separately installed librespot 0.8.0 executable with the Kalinka
- pipe bridge and matching Kalinka server and renderer streaming support.
+ Bundles librespot 0.8.0 with the Kalinka pipe bridge. Requires matching
+ Kalinka server and renderer streaming support.

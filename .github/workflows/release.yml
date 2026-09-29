@@ -1,0 +1,178 @@
+name: Release
+
+# Publishes one .deb per architecture for a `kalinka-plugin-spotify-v*` tag,
+# or for an existing tag via workflow_dispatch. Each deb bundles a native
+# librespot built on Debian 12, whose glibc is older than any supported
+# server's, so one deb per architecture installs on Debian 13, Raspberry Pi
+# OS, DietPi and Ubuntu 24.04.
+
+on:
+  push:
+    tags:
+      - 'kalinka-plugin-spotify-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing kalinka-plugin-spotify-v* tag to build and publish'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  tests:
+    name: Tests
+    uses: ./.github/workflows/tests.yml
+    with:
+      ref: ${{ github.event.inputs.tag || github.ref }}
+
+  deb:
+    name: Deb (${{ matrix.arch }})
+    needs: tests
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: debian:bookworm
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          # git before checkout, or the action downloads a tarball without the
+          # history setuptools_scm reads the version from.
+          apt-get install -y --no-install-recommends \
+            git ca-certificates curl build-essential pkg-config dpkg-dev \
+            python3 python3-venv
+
+      - name: Checkout (tag)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Trust the workspace
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: ./.github/actions/companion-core
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build pinned executable
+        run: ./scripts/build-librespot.sh
+
+      - name: Verify actual pipe output and seek
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install build -e core/packages/kalinka-plugin-sdk
+          "$RUNNER_TEMP/venv/bin/python" scripts/verify-librespot.py build/librespot/target/release/librespot
+
+      - name: Build and inspect deb
+        run: |
+          PYTHON="$RUNNER_TEMP/venv/bin/python" ./scripts/build_deb.sh build/librespot/target/release/librespot
+          deb=$(ls kalinka-plugin-spotify_*_${{ matrix.arch }}.deb)
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          case "$(dpkg-deb -f "$deb" Version)" in
+            *~dev*|*+*) echo "$deb is not a release version; is $TAG on this commit?" >&2; exit 1 ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: kalinka-plugin-spotify_*_${{ matrix.arch }}.deb
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: deb
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (tag)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Gather debs and checksums
+        run: |
+          mkdir -p release
+          find artifacts -name '*.deb' -exec cp -n {} release/ \;
+          (cd release && sha256sum *.deb > SHA256SUMS)
+          ls -l release/
+          cat release/SHA256SUMS
+
+      - name: Create / update release and upload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${TAG#kalinka-plugin-spotify-v}"
+          echo "Publishing $TAG"
+
+          # A CHANGELOG.md section for this version leads the notes when there
+          # is one; its absence never blocks a release.
+          : > notes.md
+          if [ -f CHANGELOG.md ]; then
+            awk -v want="## $VERSION" '
+              $0 == want { found = 1; next }
+              /^## / { found = 0 }
+              found
+            ' CHANGELOG.md >> notes.md
+          fi
+          if [ -s notes.md ]; then
+            printf '\n' >> notes.md
+          fi
+
+          # Read back from the package, so the notes never disagree with apt.
+          SDK=$(dpkg-deb -f release/*_amd64.deb Depends | tr ',' '\n' \
+            | sed -n 's/^ *\(kalinka-plugin-sdk .*\)$/\1/p' | paste -sd, - | sed 's/,/, /g')
+
+          cat >> notes.md <<EOF
+          ## Install
+
+          On the Kalinka server, install or upgrade to the latest release with:
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install-latest.sh | sudo bash
+          \`\`\`
+
+          It picks the package for the machine's architecture. To install by hand, download the one for yours — \`arm64\` for a Raspberry Pi running 64-bit Raspberry Pi OS, \`amd64\` for a PC — verify it with \`sha256sum -c SHA256SUMS --ignore-missing\`, and install it:
+
+          \`\`\`sh
+          sudo apt install ./kalinka-plugin-spotify_${VERSION}_arm64.deb
+          \`\`\`
+
+          The package bundles the patched librespot, so nothing else needs building. Runs on the systems Kalinka supports (Debian 13, Raspberry Pi OS 64-bit, DietPi or Ubuntu 24.04) and requires \`${SDK}\`, which comes with a compatible Kalinka server. The selected renderer must support live streams too.
+          EOF
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "kalinka-plugin-spotify $VERSION" \
+              --notes-file notes.md \
+              --generate-notes
+          fi
+          gh release upload "$TAG" release/* --clobber --repo "$GITHUB_REPOSITORY"
+          # install-latest.sh installs the "latest" release: a manual run
+          # against an older tag must not take that from a newer one.
+          NEWEST=$(git tag --list 'kalinka-plugin-spotify-v*' --sort=-v:refname | head -n 1)
+          if [ "$TAG" = "$NEWEST" ]; then
+            gh release edit "$TAG" --latest --repo "$GITHUB_REPOSITORY"
+          else
+            echo "$TAG is not the newest tag ($NEWEST); leaving the latest release alone"
+          fi

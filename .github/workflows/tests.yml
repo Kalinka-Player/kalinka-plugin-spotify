@@ -3,6 +3,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
+    inputs:
+      ref:
+        description: 'Commit or tag to test; the event ref when empty'
+        type: string
+        default: ''
 permissions:
   contents: read
 jobs:
@@ -10,43 +16,28 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
         with:
-          repository: Kalinka-Player/KalinkaPlayer
-          ref: 6162c0b0625bb41c2cb72d9c0509d6e0585b6057
-          path: core
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
+      - uses: ./.github/actions/companion-core
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
       - name: Install companion core and plugin
         run: |
-          git -C core apply ../patches/kalinka-core-3.5.patch
           python -m pip install -e core/packages/kalinka-plugin-sdk -e core/packages/kalinka-server -e '.[dev]'
       - run: python -m ruff check src tests scripts
       - run: python -m ruff format --check src tests scripts
       - run: python -m pytest
       - run: python -m build
-      - name: Build and inspect Debian package
-        run: |
-          ./scripts/build_deb.sh
-          dpkg-deb --info kalinka-plugin-spotify_*_all.deb
-          dpkg-deb --contents kalinka-plugin-spotify_*_all.deb
-      - uses: actions/upload-artifact@v4
-        with:
-          name: kalinka-plugin-spotify-deb
-          path: kalinka-plugin-spotify_*_all.deb
-          if-no-files-found: error
   librespot:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
         with:
-          repository: Kalinka-Player/KalinkaPlayer
-          ref: 6162c0b0625bb41c2cb72d9c0509d6e0585b6057
-          path: core
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
+      - uses: ./.github/actions/companion-core
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -60,6 +51,18 @@ jobs:
           --features rustls-tls-native-roots --lib kalinka_
       - name: Verify actual pipe output and seek
         run: |
-          git -C core apply ../patches/kalinka-core-3.5.patch
           python -m pip install -e core/packages/kalinka-plugin-sdk
           python scripts/verify-librespot.py build/librespot/target/release/librespot
+      - name: Build and inspect Debian package
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev
+          python -m pip install build
+          ./scripts/build_deb.sh build/librespot/target/release/librespot
+          dpkg-deb --info kalinka-plugin-spotify_*_amd64.deb
+          dpkg-deb --contents kalinka-plugin-spotify_*_amd64.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kalinka-plugin-spotify-deb
+          path: kalinka-plugin-spotify_*_amd64.deb
+          if-no-files-found: error
