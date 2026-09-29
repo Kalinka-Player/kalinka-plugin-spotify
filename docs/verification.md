@@ -1,5 +1,9 @@
 # Verification record
 
+The core changes recorded below have since merged in KalinkaPlayer PR #225.
+CI and release builds now use the merged core directly; references to the
+companion core patch below describe historical checks before it was removed.
+
 Checks run locally on 2026-09-28 and 2026-09-29. Offline checks used no Spotify credentials.
 User-assisted local connection checks are recorded below; remote-speaker
 playback remains unverified.
