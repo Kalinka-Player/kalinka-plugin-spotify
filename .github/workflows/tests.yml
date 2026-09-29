@@ -98,6 +98,20 @@ jobs:
           rpm -qpi kalinka-plugin-spotify-*.x86_64.rpm
           rpm -qplv kalinka-plugin-spotify-*.x86_64.rpm
           rpm -qpR kalinka-plugin-spotify-*.x86_64.rpm
+      - name: Install and remove RPM
+        # No kalinka-server here: its scriptlets must tolerate that, and
+        # removal must leave nothing of this package behind.
+        run: |
+          rpm -i --nodeps kalinka-plugin-spotify-*.x86_64.rpm
+          /usr/libexec/kalinka-plugin-spotify/librespot --kalinka-capabilities
+          rpm -e --nodeps kalinka-plugin-spotify
+          left=$(find /opt/kalinka /usr/libexec /usr/share/doc /usr/share/licenses \
+            -path '*kalinka*plugin*spotify*' -print 2>/dev/null)
+          if [ -n "$left" ]; then
+            echo "Left behind after removal:" >&2
+            echo "$left" >&2
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: kalinka-plugin-spotify-rpm

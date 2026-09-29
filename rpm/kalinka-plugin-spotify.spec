@@ -58,8 +58,11 @@ systemctl try-restart kalinka.service >/dev/null 2>&1 || :
 /opt/kalinka/wheels/%{wheel}
 %dir %{_libexecdir}/kalinka-plugin-spotify
 %{_libexecdir}/kalinka-plugin-spotify/librespot
+# Own these directories too, or removal leaves them behind empty.
+%dir %{_licensedir}/%{name}
 %license %{_licensedir}/%{name}/LICENSE
 %license %{_licensedir}/%{name}/librespot-LICENSE
+%dir %{_docdir}/%{name}
 %doc %{_docdir}/%{name}/README.md
 
 %changelog
