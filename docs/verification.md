@@ -15,6 +15,17 @@ Five regression cases failed before the fix. All 110 plugin tests now pass,
 including delayed disconnects on ASGI 2.0/2.4, 20 alternating rapid seeks,
 timeout/retry without restarting the producer, and disabling during the wait.
 
+A subsequent live seek check exposed a separate renderer stall: its audio worker
+treated a control-cancelled input wait as ordinary starvation and restarted the
+buffer-fill loop before acknowledging the command. The pending pause blocked the
+renderer command loop, including its heartbeat, until Spotify's watchdog expired.
+The companion renderer patch now returns from an interrupted read to process the
+explicit control. Two ARM64 regression tests reproduced unanswered pause/seek
+commands before the fix and pass afterward. A third test confirms ordinary live
+starvation remains buffering and resumes on incoming audio without entering
+paused state. The Pi's emitter suite passes 19 tests, with one test requiring a
+real-time audio device skipped; the checks used silent ALSA output.
+
 The latest request-error fix retires superseded captures without raising an
 `OSError` while their renderer still has an HTTP request open. Reads stop and
 wait for the actual disconnect; no EOF is fabricated. The server now watches
