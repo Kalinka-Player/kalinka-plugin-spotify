@@ -61,7 +61,7 @@ class Capture:
 
     async def append(self, data):
         async with self.condition:
-            if self.cancelled or self.failure or self.complete:
+            if self.retired or self.cancelled or self.failure or self.complete:
                 raise RuntimeError("Capture is no longer writable")
             if self.available + len(data) > self.max_bytes:
                 self.failure = "Spotify playback cache limit exceeded"
@@ -82,10 +82,11 @@ class Capture:
             self.complete = True
             self.condition.notify_all()
 
-    async def retire(self, failure=None):
+    async def retire(self, failure=None, *, wait_for_disconnect=False):
         async with self.condition:
-            self.retired = self.cancelled = True
-            self.failure = failure
+            self.retired = True
+            self.cancelled |= not wait_for_disconnect or failure is not None
+            self.failure = failure or self.failure
             self.condition.notify_all()
             self._close_if_unused()
 
@@ -127,8 +128,10 @@ class Reader:
                             self.closed
                             or c.cancelled
                             or c.failure
-                            or c.complete
-                            or self.position < c.available
+                            or (
+                                not c.retired
+                                and (c.complete or self.position < c.available)
+                            )
                         )
                     ),
                     c.timeout,
