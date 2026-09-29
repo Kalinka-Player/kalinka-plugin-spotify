@@ -1,0 +1,6 @@
+include README.md LICENSE
+recursive-include docs *.md *LICENSE
+recursive-include patches *.patch
+recursive-include scripts *.py *.sh
+recursive-include tests *.py *.ogg *.md
+recursive-include debian *

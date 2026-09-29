@@ -1,0 +1,2078 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index c135de1..e00f65f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1812,6 +1812,7 @@ dependencies = [
+  "librespot-playback",
+  "librespot-protocol",
+  "log",
++ "serde_json",
+  "sha1",
+  "sysinfo",
+  "thiserror 2.0.17",
+@@ -1997,6 +1998,7 @@ dependencies = [
+  "rand_distr",
+  "rodio",
+  "sdl2",
++ "serde_json",
+  "shell-words",
+  "symphonia",
+  "thiserror 2.0.17",
+diff --git a/Cargo.toml b/Cargo.toml
+index c892625..4afa8a0 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -152,6 +152,7 @@ librespot-playback = { version = "0.8.0", path = "playback", default-features =
+ librespot-protocol = { version = "0.8.0", path = "protocol", default-features = false }
+ 
+ [dependencies]
++serde_json = "1"
+ librespot-audio.workspace = true
+ librespot-connect.workspace = true
+ librespot-core.workspace = true
+diff --git a/connect/src/context_bans.rs b/connect/src/context_bans.rs
+new file mode 100644
+index 0000000..7e1aab1
+--- /dev/null
++++ b/connect/src/context_bans.rs
+@@ -0,0 +1,155 @@
++// Spotify stores Hide Song separately from resolved playlist metadata.
++// Keep the context URI: hiding a song in one playlist must not hide its album.
++use crate::core::{Error, Session};
++use std::{
++    collections::{HashMap, HashSet},
++    time::Duration,
++};
++
++pub(crate) type ContextBans = HashMap<String, HashSet<String>>;
++
++fn apply_page(bytes: &[u8], bans: &mut ContextBans) -> Result<Option<String>, Error> {
++    let page: serde_json::Value = serde_json::from_slice(bytes)?;
++    if !page["sync_token"].is_string() {
++        return Err(Error::failed_precondition(
++            "Invalid hidden-song collection response",
++        ));
++    }
++    if let Some(items) = page.get("items") {
++        let items = items
++            .as_array()
++            .ok_or_else(|| Error::failed_precondition("Invalid hidden-song items"))?;
++        for item in items {
++            let uri = item["uri"].as_str().filter(|s| !s.is_empty());
++            let context = item["context_uri"].as_str().filter(|s| !s.is_empty());
++            let (Some(uri), Some(context)) = (uri, context) else {
++                return Err(Error::failed_precondition(
++                    "Invalid contextual hidden-song item",
++                ));
++            };
++            let removed = match item.get("is_removed") {
++                None => false,
++                Some(v) => v
++                    .as_bool()
++                    .ok_or_else(|| Error::failed_precondition("Invalid hidden-song tombstone"))?,
++            };
++            let tracks = bans.entry(context.to_owned()).or_default();
++            if removed {
++                tracks.remove(uri);
++            } else {
++                tracks.insert(uri.to_owned());
++            }
++        }
++    }
++    match page.get("next_page_token") {
++        None => Ok(None),
++        Some(v) => v
++            .as_str()
++            .map(|s| (!s.is_empty()).then(|| s.to_owned()))
++            .ok_or_else(|| Error::failed_precondition("Invalid hidden-song page token")),
++    }
++}
++
++async fn fetch(session: &Session) -> Result<ContextBans, Error> {
++    let mut bans = ContextBans::new();
++    let mut pagination_token = String::new();
++    let mut seen = HashSet::new();
++    for _ in 0..200 {
++        let body = serde_json::json!({
++            "username": session.username(), "set": "playcontextbans",
++            "limit": 500, "pagination_token": pagination_token,
++        })
++        .to_string();
++        let headers = [(
++            "content-type".parse().expect("constant header name"),
++            "application/json".parse().expect("constant header value"),
++        )]
++        .into_iter()
++        .collect();
++        let bytes = session
++            .spclient()
++            .request_as_json(
++                &"POST".parse().expect("constant HTTP method"),
++                "/collection/v2/paging",
++                Some(headers),
++                Some(&body),
++            )
++            .await?;
++        match apply_page(&bytes, &mut bans)? {
++            None => {
++                bans.retain(|_, tracks| !tracks.is_empty());
++                return Ok(bans);
++            }
++            Some(next) if seen.insert(next.clone()) => pagination_token = next,
++            Some(_) => {
++                return Err(Error::failed_precondition(
++                    "Repeated hidden-song page token",
++                ));
++            }
++        }
++    }
++    Err(Error::resource_exhausted(
++        "Hidden-song collection exceeds page limit",
++    ))
++}
++
++pub(crate) async fn refresh(
++    session: Session,
++    delay: Duration,
++) -> (tokio::time::Instant, Result<ContextBans, Error>) {
++    tokio::time::sleep(delay).await;
++    let started = tokio::time::Instant::now();
++    // Keep a failed or partial refresh from replacing the last complete list.
++    let result = tokio::time::timeout(Duration::from_secs(5), fetch(&session))
++        .await
++        .map_err(|_| Error::deadline_exceeded("Hidden-song refresh timed out"))
++        .and_then(|result| result);
++    (started, result)
++}
++
++#[cfg(test)]
++mod kalinka_hidden_tests {
++    use super::*;
++
++    #[test]
++    fn pages_keep_contexts_separate_and_apply_tombstones() {
++        let mut bans = ContextBans::new();
++        assert_eq!(
++            apply_page(
++                br#"{"sync_token":"s","next_page_token":"two","items":[
++            {"uri":"track:a","context_uri":"playlist:a","item_data":{}},
++            {"uri":"track:a","context_uri":"playlist:b"},
++            {"uri":"track:b","context_uri":"playlist:a"}]}"#,
++                &mut bans
++            )
++            .unwrap(),
++            Some("two".into())
++        );
++        assert_eq!(
++            apply_page(
++                br#"{"sync_token":"s","items":[
++            {"uri":"track:a","context_uri":"playlist:a","is_removed":true}]}"#,
++                &mut bans
++            )
++            .unwrap(),
++            None
++        );
++        assert!(!bans["playlist:a"].contains("track:a"));
++        assert!(bans["playlist:a"].contains("track:b"));
++        assert!(bans["playlist:b"].contains("track:a"));
++    }
++
++    #[test]
++    fn accepts_empty_collection_but_rejects_malformed_responses() {
++        assert!(apply_page(br#"{"sync_token":"s"}"#, &mut ContextBans::new()).is_ok());
++        for bytes in [
++            br#"{}"#.as_slice(),
++            br#"{"sync_token":"s","items":{}}"#,
++            br#"{"sync_token":"s","items":[{"uri":"track:a"}]}"#,
++            br#"{"sync_token":"s","next_page_token":true}"#,
++            br#"{"sync_token":"s","items":[{"uri":"t","context_uri":"c","is_removed":"false"}]}"#,
++        ] {
++            assert!(apply_page(bytes, &mut ContextBans::new()).is_err());
++        }
++    }
++}
+diff --git a/connect/src/lib.rs b/connect/src/lib.rs
+index ba00aa4..bfceb8a 100644
+--- a/connect/src/lib.rs
++++ b/connect/src/lib.rs
+@@ -8,6 +8,7 @@ use librespot_core as core;
+ use librespot_playback as playback;
+ use librespot_protocol as protocol;
+ 
++mod context_bans;
+ mod context_resolver;
+ mod model;
+ mod shuffle_vec;
+diff --git a/connect/src/spirc.rs b/connect/src/spirc.rs
+index 3f9a06f..4e7cc91 100644
+--- a/connect/src/spirc.rs
++++ b/connect/src/spirc.rs
+@@ -109,6 +109,11 @@ struct SpircTask {
+     update_state: bool,
+ 
+     spirc_id: usize,
++    kalinka_bridge: bool,
++    kalinka_suspended: bool,
++    context_bans_refreshed: Option<tokio::time::Instant>,
++    #[cfg(test)]
++    context_bans_pending: Option<crate::context_bans::ContextBans>,
+ }
+ 
+ static SPIRC_COUNTER: AtomicUsize = AtomicUsize::new(0);
+@@ -129,6 +134,8 @@ enum SpircCommand {
+     Disconnect { pause: bool },
+     SetPosition(u32),
+     SetVolume(u16),
++    ReportVolume(u16),
++    KalinkaSuspend { id: u64, position_ms: u32 },
+     Activate,
+     Transfer(Option<TransferRequest>),
+     Load(LoadRequest),
+@@ -255,6 +262,11 @@ impl Spirc {
+             update_state: false,
+ 
+             spirc_id,
++            kalinka_bridge: crate::playback::kalinka::active(),
++            kalinka_suspended: false,
++            context_bans_refreshed: None,
++            #[cfg(test)]
++            context_bans_pending: None,
+         };
+ 
+         let spirc = Spirc { commands: cmd_tx };
+@@ -369,6 +381,19 @@ impl Spirc {
+         Ok(self.commands.send(SpircCommand::SetVolume(volume))?)
+     }
+ 
++    /// Report an external renderer's actual volume without emitting a new
++    /// volume request back to that renderer.
++    pub fn report_volume(&self, volume: u16) -> Result<(), Error> {
++        Ok(self.commands.send(SpircCommand::ReportVolume(volume))?)
++    }
++
++    /// Keep Connect selected, but retire audio until a new play request.
++    pub fn kalinka_suspend(&self, id: u64, position_ms: u32) -> Result<(), Error> {
++        Ok(self
++            .commands
++            .send(SpircCommand::KalinkaSuspend { id, position_ms })?)
++    }
++
+     /// Updates the position to the given value.
+     ///
+     /// Does nothing if we are not the active device.
+@@ -438,6 +463,10 @@ impl SpircTask {
+             return;
+         }
+ 
++        let mut hidden_refresh = Box::pin(crate::context_bans::refresh(
++            self.session.clone(),
++            Duration::ZERO,
++        ));
+         while !self.session.is_invalid() && !self.shutdown {
+             let commands = self.commands.as_mut();
+             let player_events = self.player_events.as_mut();
+@@ -508,7 +537,7 @@ impl SpircTask {
+                     }
+                 },
+                 event = async { player_events?.recv().await }, if player_events.is_some() => if let Some(event) = event {
+-                    if let Err(e) = self.handle_player_event(event) {
++                    if let Err(e) = self.handle_player_event(event).await {
+                         error!("could not dispatch player event: {e}");
+                     }
+                 },
+@@ -560,6 +589,12 @@ impl SpircTask {
+                         }
+                     }
+                 },
++                bans = &mut hidden_refresh, if self.kalinka_bridge && self.connect_established => {
++                    if self.apply_context_bans(bans) {
++                        self.skip_hidden_current_track();
++                    }
++                    hidden_refresh = Box::pin(crate::context_bans::refresh(self.session.clone(), Duration::from_secs(15)));
++                },
+                 else => break
+             }
+         }
+@@ -632,6 +667,12 @@ impl SpircTask {
+     async fn handle_command(&mut self, cmd: SpircCommand) -> Result<(), Error> {
+         trace!("Received SpircCommand::{cmd:?}");
+         match cmd {
++            SpircCommand::KalinkaSuspend { id, position_ms } => {
++                self.handle_kalinka_suspend(id, position_ms);
++                if !self.connect_state.is_active() {
++                    return Ok(());
++                }
++            }
+             SpircCommand::Shutdown => {
+                 trace!("Received SpircCommand::Shutdown");
+                 self.handle_pause();
+@@ -669,8 +710,8 @@ impl SpircTask {
+             SpircCommand::Play => self.handle_play(),
+             SpircCommand::PlayPause => self.handle_play_pause(),
+             SpircCommand::Pause => self.handle_pause(),
+-            SpircCommand::Prev => self.handle_prev()?,
+-            SpircCommand::Next => self.handle_next(None)?,
++            SpircCommand::Prev => self.handle_prev_refreshed().await?,
++            SpircCommand::Next => self.handle_next_refreshed(None).await?,
+             SpircCommand::VolumeUp => self.handle_volume_up(),
+             SpircCommand::VolumeDown => self.handle_volume_down(),
+             SpircCommand::Shuffle(shuffle) => self.handle_shuffle(shuffle)?,
+@@ -678,13 +719,19 @@ impl SpircTask {
+             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
+             SpircCommand::SetPosition(position) => self.handle_seek(position),
+             SpircCommand::SetVolume(volume) => self.set_volume(volume),
++            SpircCommand::ReportVolume(volume) => self.update_reported_volume(volume, false),
+             SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
+         };
+ 
+         self.notify().await
+     }
+ 
+-    fn handle_player_event(&mut self, event: PlayerEvent) -> Result<(), Error> {
++    async fn handle_player_event(&mut self, event: PlayerEvent) -> Result<(), Error> {
++        // Buffered progress/end events must not undo the handoff or advance
++        // Spotify's queue. The next explicit play loads a fresh request ID.
++        if self.kalinka_suspended || (self.kalinka_bridge && !self.connect_state.is_active()) {
++            return Ok(());
++        }
+         if let PlayerEvent::TrackChanged { audio_item } = event {
+             self.connect_state.update_duration(audio_item.duration_ms);
+             self.update_state = true;
+@@ -717,7 +764,7 @@ impl SpircTask {
+                     .repeat_track()
+                     .then(|| self.connect_state.current_track(|t| t.uri.clone()));
+ 
+-                self.handle_next(next_track)?
++                self.handle_next_refreshed(next_track).await?
+             }
+             PlayerEvent::Loading { .. } => match self.play_status {
+                 SpircPlayStatus::LoadingPlay { position_ms } => {
+@@ -807,7 +854,7 @@ impl SpircTask {
+             PlayerEvent::Unavailable { track_id, .. } => {
+                 self.handle_unavailable(&track_id)?;
+                 if self.connect_state.current_track(|t| &t.uri) == &track_id.to_uri()? {
+-                    self.handle_next(None)?
++                    self.handle_next_refreshed(None).await?
+                 }
+             }
+             _ => return Ok(()),
+@@ -932,8 +979,12 @@ impl SpircTask {
+                 && cluster.active_device_id != self.session.device_id();
+             if became_inactive {
+                 info!("device became inactive");
+-                self.handle_disconnect().await?;
+-                self.handle_stop();
++                if self.kalinka_bridge {
++                    self.handle_kalinka_transfer_away();
++                } else {
++                    self.handle_disconnect().await?;
++                    self.handle_stop();
++                }
+             } else if self.connect_state.is_active() {
+                 // fixme: workaround fix, because of missing information why it behaves like it does
+                 //  background: when another device sends a connect-state update, some player's position de-syncs
+@@ -972,6 +1023,9 @@ impl SpircTask {
+     async fn handle_request(&mut self, request: Request) -> Result<(), Error> {
+         use Command::*;
+ 
++        if matches!(&request.command, Play(_) | Transfer(_)) {
++            self.refresh_context_bans().await;
++        }
+         match request.command {
+             // errors and unknown commands
+             Transfer(transfer) if transfer.data.is_none() => {
+@@ -1049,7 +1103,7 @@ impl SpircTask {
+                 )
+                 .await?;
+ 
+-                self.connect_state.set_origin(play.play_origin)
++                self.connect_state.set_origin(play.play_origin);
+             }
+             Pause(_) => self.handle_pause(),
+             SeekTo(seek_to) => {
+@@ -1078,8 +1132,11 @@ impl SpircTask {
+                     self.handle_shuffle(shuffle)?;
+                 }
+             }
+-            SkipNext(skip_next) => self.handle_next(skip_next.track.map(|t| t.uri))?,
+-            SkipPrev(_) => self.handle_prev()?,
++            SkipNext(skip_next) => {
++                self.handle_next_refreshed(skip_next.track.map(|t| t.uri))
++                    .await?
++            }
++            SkipPrev(_) => self.handle_prev_refreshed().await?,
+             Resume(_) if matches!(self.play_status, SpircPlayStatus::Stopped) => {
+                 self.load_track(true, 0)?
+             }
+@@ -1213,6 +1270,7 @@ impl SpircTask {
+     }
+ 
+     async fn handle_disconnect(&mut self) -> Result<(), Error> {
++        self.kalinka_suspended = false;
+         self.context_resolver.clear();
+ 
+         self.play_status = SpircPlayStatus::Stopped {};
+@@ -1228,6 +1286,26 @@ impl SpircTask {
+         Ok(())
+     }
+ 
++    fn handle_kalinka_transfer_away(&mut self) {
++        // The cluster already names another active device. Sending our own
++        // stopped/reset state now can overwrite that device's transfer position.
++        let now = self.now_ms();
++        let position_ms = self.position();
++        self.connect_state.update_position(position_ms, now);
++        self.connect_state.set_active(false);
++        self.context_resolver.clear();
++        self.transfer_state = None;
++        self.kalinka_suspended = false;
++        self.play_status = SpircPlayStatus::Stopped;
++        self.play_request_id = None;
++        self.update_state = false;
++        self.update_volume = false;
++        // Stop/retire only the local decoder and HTTP resource. Do not reset
++        // the shared track/queue or send another cloud disconnect notification.
++        self.player
++            .emit_session_disconnected_event(self.session.connection_id(), self.session.username());
++    }
++
+     fn handle_stop(&mut self) {
+         self.player.stop();
+         self.connect_state.update_position(0, self.now_ms());
+@@ -1273,6 +1351,17 @@ impl SpircTask {
+         page: Option<ContextPage>,
+         fallback_index: Option<usize>,
+     ) -> Result<(), Error> {
++        if self.kalinka_bridge {
++            // An explicit Play supersedes an unfinished device transfer. Its
++            // old context/queue must not be applied after the new selection.
++            let pending = self.transfer_state.take().is_some() || self.context_resolver.has_next();
++            self.context_resolver.clear();
++            if pending {
++                // Even the same URI must be resolved again if its previous
++                // transfer or paginated context was incomplete.
++                self.connect_state.reset_context(ResetContext::Completely);
++            }
++        }
+         self.connect_state
+             .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
+                 ResetContext::WhenDifferent(uri)
+@@ -1361,6 +1450,11 @@ impl SpircTask {
+             self.add_autoplay_resolving_when_required();
+         }
+ 
++        if self.kalinka_bridge && index.is_none() && self.connect_state.current_track_is_banned() {
++            // Starting the whole context should advance; explicitly selecting
++            // a hidden song is rejected by load_track, just like Spotify.
++            self.connect_state.next_track()?;
++        }
+         if self.connect_state.current_track(MessageField::is_some) {
+             self.load_track(cmd_options.start_playing, cmd_options.seek_to)?;
+         } else {
+@@ -1436,7 +1530,31 @@ impl SpircTask {
+         Ok(())
+     }
+ 
++    fn handle_kalinka_suspend(&mut self, id: u64, position_ms: u32) {
++        if self.connect_state.is_active() {
++            let position_ms = position_ms.min(self.connect_state.player().duration.max(0) as u32);
++            self.kalinka_suspended = true;
++            self.play_status = SpircPlayStatus::Paused {
++                position_ms,
++                preloading_of_next_track_triggered: false,
++            };
++            self.connect_state
++                .update_position(position_ms, self.now_ms());
++            self.connect_state.set_status(&self.play_status);
++        }
++        self.player.kalinka_suspend(id);
++    }
++
+     fn handle_play(&mut self) {
++        if self.kalinka_suspended {
++            let position_ms = self.position();
++            if self.load_track(true, position_ms).is_err() {
++                crate::playback::kalinka::emit(
++                    serde_json::json!({"event":"error", "code":"control_failed"}),
++                );
++            }
++            return;
++        }
+         match self.play_status {
+             SpircPlayStatus::Paused {
+                 position_ms,
+@@ -1507,7 +1625,9 @@ impl SpircTask {
+ 
+         self.connect_state
+             .update_position(position_ms, self.now_ms());
+-        self.player.seek(position_ms);
++        if !self.kalinka_suspended {
++            self.player.seek(position_ms);
++        }
+         let now = self.now_ms();
+         match self.play_status {
+             SpircPlayStatus::Stopped => (),
+@@ -1608,16 +1728,38 @@ impl SpircTask {
+         self.context_resolver.add(resolve);
+     }
+ 
++    async fn handle_next_refreshed(&mut self, track_uri: Option<String>) -> Result<(), Error> {
++        // A hide on the controller may arrive just before Next or track end.
++        // Do not choose from the periodically cached list in that case.
++        self.refresh_context_bans().await;
++        self.handle_next(track_uri)
++    }
++
++    async fn handle_prev_refreshed(&mut self) -> Result<(), Error> {
++        self.refresh_context_bans().await;
++        self.handle_prev()
++    }
++
+     fn handle_next(&mut self, track_uri: Option<String>) -> Result<(), Error> {
+         let continue_playing = self.connect_state.is_playing();
+ 
+         let current_uri = self.connect_state.current_track(|t| &t.uri);
+-        let mut has_next_track =
+-            matches!(track_uri, Some(ref track_uri) if current_uri == track_uri);
++        let mut has_next_track = matches!(track_uri, Some(ref track_uri) if current_uri == track_uri)
++            && !self.connect_state.current_track_is_banned();
+ 
++        let track_uri = if self.connect_state.current_track_is_banned()
++            && track_uri.as_ref() == Some(current_uri)
++        {
++            None
++        } else {
++            track_uri
++        };
+         if !has_next_track {
+             has_next_track = loop {
+                 let index = self.connect_state.next_track()?;
++                if index.is_none() {
++                    break false;
++                }
+ 
+                 let current_uri = self.connect_state.current_track(|t| &t.uri);
+                 if matches!(track_uri, Some(ref track_uri) if current_uri != track_uri) {
+@@ -1765,12 +1907,17 @@ impl SpircTask {
+     }
+ 
+     fn load_track(&mut self, start_playing: bool, position_ms: u32) -> Result<(), Error> {
++        self.kalinka_suspended = false;
+         if self.connect_state.current_track(MessageField::is_none) {
+             debug!("current track is none, stopping playback");
+             self.handle_stop();
+             return Ok(());
+         }
+ 
++        if self.kalinka_bridge && self.connect_state.current_track_is_banned() {
++            self.handle_stop();
++            return Ok(());
++        }
+         let current_uri = self.connect_state.current_track(|t| &t.uri);
+         let id = SpotifyUri::from_uri(current_uri)?;
+         self.player.load(id, start_playing, position_ms);
+@@ -1787,7 +1934,75 @@ impl SpircTask {
+         Ok(())
+     }
+ 
++    fn apply_context_bans(
++        &mut self,
++        (started, result): (
++            tokio::time::Instant,
++            Result<crate::context_bans::ContextBans, Error>,
++        ),
++    ) -> bool {
++        if self
++            .context_bans_refreshed
++            .is_some_and(|last| started < last)
++        {
++            return false;
++        }
++        if result.is_ok() {
++            self.context_bans_refreshed = Some(started);
++        }
++        match result {
++            Ok(bans) if bans != self.connect_state.context_bans => {
++                let count: usize = bans.values().map(|tracks| tracks.len()).sum();
++                self.connect_state.context_bans = bans;
++                crate::playback::kalinka::emit(serde_json::json!({
++                    "event": "hidden_tracks", "count": count,
++                }));
++                true
++            }
++            Ok(_) => false,
++            Err(why) => {
++                warn!(
++                    "Hidden-song refresh failed: {:?}; keeping previous list",
++                    why.kind
++                );
++                false
++            }
++        }
++    }
++
++    fn skip_hidden_current_track(&mut self) {
++        // Only a background update advances here. A navigation command applies
++        // the list first and then makes exactly one selection of its own.
++        if self.connect_state.is_active()
++            && !self.kalinka_suspended
++            && matches!(
++                self.play_status,
++                SpircPlayStatus::Playing { .. } | SpircPlayStatus::LoadingPlay { .. }
++            )
++            && self.connect_state.current_track_is_banned()
++        {
++            if let Err(why) = self.handle_next(None) {
++                warn!("Failed to advance past hidden track: {:?}", why.kind);
++            }
++        }
++    }
++
++    async fn refresh_context_bans(&mut self) {
++        #[cfg(test)]
++        if let Some(bans) = self.context_bans_pending.take() {
++            self.apply_context_bans((tokio::time::Instant::now(), Ok(bans)));
++            return;
++        }
++        if self.kalinka_bridge && self.connect_established {
++            let result = crate::context_bans::refresh(self.session.clone(), Duration::ZERO).await;
++            self.apply_context_bans(result);
++        }
++    }
++
+     async fn notify(&mut self) -> Result<(), Error> {
++        if self.kalinka_bridge && !self.connect_state.is_active() {
++            return Ok(());
++        }
+         self.connect_state.set_status(&self.play_status);
+ 
+         if self.connect_state.is_playing() {
+@@ -1796,7 +2011,6 @@ impl SpircTask {
+         }
+ 
+         self.connect_state.set_now(self.now_ms() as u64);
+-
+         self.connect_state
+             .send_state(&self.session)
+             .await
+@@ -1805,7 +2019,10 @@ impl SpircTask {
+ 
+     fn set_volume(&mut self, volume: u16) {
+         debug!("SpircTask::set_volume({volume})");
++        self.update_reported_volume(volume, true);
++    }
+ 
++    fn update_reported_volume(&mut self, volume: u16, emit_request: bool) {
+         let old_volume = self.connect_state.device_info().volume;
+         let new_volume = volume as u32;
+         if old_volume != new_volume || self.mixer.volume() != volume {
+@@ -1816,7 +2033,7 @@ impl SpircTask {
+             if let Some(cache) = self.session.cache() {
+                 cache.save_volume(volume)
+             }
+-            if self.connect_state.is_active() {
++            if emit_request && self.connect_state.is_active() {
+                 self.player.emit_volume_changed_event(volume);
+             }
+         }
+@@ -1828,3 +2045,489 @@ impl Drop for SpircTask {
+         debug!("drop Spirc[{}]", self.spirc_id);
+     }
+ }
++
++#[cfg(test)]
++mod kalinka_bridge_tests {
++    use super::*;
++    use crate::core::config::SessionConfig;
++    use crate::playback::{
++        audio_backend,
++        config::{AudioFormat, PlayerConfig},
++        mixer::{MixerConfig, softmixer::SoftMixer},
++    };
++
++    async fn freshly_hidden_task(
++        hidden: &[usize],
++        position: usize,
++    ) -> (SpircTask, PlayerEventChannel, Vec<String>) {
++        let (mut task, events) = offline_task();
++        let tracks: Vec<String> = (0..5)
++            .map(|i| format!("spotify:local:artist:album:track{i}:180"))
++            .collect();
++        task.handle_load(
++            LoadRequest {
++                context: PlayContext::Tracks(tracks.clone()),
++                options: LoadRequestOptions {
++                    start_playing: false,
++                    playing_track: Some(PlayingTrack::Index(position as u32)),
++                    ..Default::default()
++                },
++            },
++            None,
++            None,
++        )
++        .await
++        .unwrap();
++        task.play_status = SpircPlayStatus::Playing {
++            nominal_start_time: task.now_ms(),
++            preloading_of_next_track_triggered: false,
++        };
++        task.connect_state.set_status(&task.play_status);
++        task.play_request_id = Some(42);
++        // The collection has changed, but the periodic refresh has not run.
++        task.context_bans_pending = Some(
++            [(
++                "spotify:web-api".into(),
++                hidden.iter().map(|i| tracks[*i].clone()).collect(),
++            )]
++            .into_iter()
++            .collect(),
++        );
++        (task, events, tracks)
++    }
++
++    fn skip_request(endpoint: &str) -> Request {
++        serde_json::from_value(
++            serde_json::json!({"message_id":1,"sent_by_device_id":"test-phone",
++            "command":{"endpoint":endpoint,"logging_params":{}}}),
++        )
++        .unwrap()
++    }
++
++    #[tokio::test]
++    async fn next_and_natural_end_refresh_before_selecting_newly_hidden_tracks() {
++        for natural in [false, true] {
++            let (mut task, _events, tracks) = freshly_hidden_task(&[1, 2], 0).await;
++            if natural {
++                task.handle_player_event(PlayerEvent::EndOfTrack {
++                    play_request_id: 42,
++                    track_id: SpotifyUri::from_uri(&tracks[0]).unwrap(),
++                })
++                .await
++                .unwrap();
++            } else {
++                task.handle_request(skip_request("skip_next"))
++                    .await
++                    .unwrap();
++            }
++            assert_eq!(
++                task.connect_state.current_track(|t| t.uri.clone()),
++                tracks[3]
++            );
++            assert!(
++                task.context_bans_pending.is_none(),
++                "selection must fetch current bans"
++            );
++        }
++    }
++
++    #[tokio::test]
++    async fn next_refresh_does_not_advance_twice_when_current_song_was_hidden() {
++        let (mut task, _events, tracks) = freshly_hidden_task(&[0, 1], 0).await;
++        task.handle_request(skip_request("skip_next"))
++            .await
++            .unwrap();
++        assert_eq!(
++            task.connect_state.current_track(|t| t.uri.clone()),
++            tracks[2]
++        );
++        assert!(task.context_bans_pending.is_none());
++    }
++
++    #[tokio::test]
++    async fn previous_refresh_skips_two_newly_hidden_tracks() {
++        let (mut task, _events, tracks) = freshly_hidden_task(&[1, 2], 3).await;
++        task.handle_request(skip_request("skip_prev"))
++            .await
++            .unwrap();
++        assert_eq!(
++            task.connect_state.current_track(|t| t.uri.clone()),
++            tracks[0]
++        );
++        assert!(task.context_bans_pending.is_none());
++    }
++
++    #[tokio::test]
++    async fn whole_context_skips_hidden_first_song_but_explicit_selection_stops() {
++        let tracks: Vec<String> = vec![
++            "spotify:local:artist:album:hidden:180".into(),
++            "spotify:local:artist:album:allowed:180".into(),
++        ];
++        for explicit in [false, true] {
++            let (mut task, _events) = offline_task();
++            task.connect_state.context_bans.insert(
++                "spotify:web-api".into(),
++                [tracks[0].clone()].into_iter().collect(),
++            );
++            task.handle_load(
++                LoadRequest {
++                    context: PlayContext::Tracks(tracks.clone()),
++                    options: LoadRequestOptions {
++                        start_playing: false,
++                        playing_track: explicit.then_some(PlayingTrack::Index(0)),
++                        ..Default::default()
++                    },
++                },
++                None,
++                None,
++            )
++            .await
++            .unwrap();
++            if explicit {
++                assert!(matches!(task.play_status, SpircPlayStatus::Stopped));
++            } else {
++                assert_eq!(
++                    task.connect_state.current_track(|t| t.uri.clone()),
++                    tracks[1]
++                );
++                assert!(matches!(
++                    task.play_status,
++                    SpircPlayStatus::LoadingPause { .. }
++                ));
++            }
++        }
++    }
++
++    #[tokio::test]
++    async fn hidden_refresh_failure_keeps_list_and_cannot_reacquire_after_handoff() {
++        let (mut task, _events) = offline_task();
++        task.handle_load(
++            LoadRequest {
++                context: PlayContext::Tracks(vec![
++                    "spotify:local:artist:album:one:180".into(),
++                    "spotify:local:artist:album:two:180".into(),
++                ]),
++                options: LoadRequestOptions {
++                    start_playing: false,
++                    ..Default::default()
++                },
++            },
++            None,
++            None,
++        )
++        .await
++        .unwrap();
++        task.kalinka_suspended = true;
++        let original = task.connect_state.current_track(|t| t.uri.clone());
++        let bans = [(
++            "spotify:web-api".into(),
++            [original.clone()].into_iter().collect(),
++        )]
++        .into_iter()
++        .collect();
++        task.apply_context_bans((tokio::time::Instant::now(), Ok(bans)));
++        task.skip_hidden_current_track();
++        task.apply_context_bans((
++            tokio::time::Instant::now(),
++            Err(Error::unavailable("test unavailable")),
++        ));
++        assert!(task.connect_state.current_track_is_banned());
++        let older = tokio::time::Instant::now();
++        task.apply_context_bans((older + Duration::from_secs(1), Ok(Default::default())));
++        let stale = [(
++            "spotify:web-api".into(),
++            [original.clone()].into_iter().collect(),
++        )]
++        .into_iter()
++        .collect();
++        task.apply_context_bans((older, Ok(stale)));
++        assert!(!task.connect_state.current_track_is_banned());
++        assert!(task.kalinka_suspended);
++        assert_eq!(
++            task.connect_state.current_track(|t| t.uri.clone()),
++            original
++        );
++    }
++
++    fn offline_task() -> (SpircTask, PlayerEventChannel) {
++        // No account, network connection, or audio device: use the real player
++        // event channel and Connect state with all network streams left idle.
++        let session = Session::new(SessionConfig::default(), None);
++        let mixer = Arc::new(SoftMixer::open(MixerConfig::default()).unwrap());
++        let player = Player::new(
++            PlayerConfig::default(),
++            session.clone(),
++            mixer.get_soft_volume(),
++            || audio_backend::find(Some("pipe".into())).unwrap()(None, AudioFormat::S16),
++        );
++        let events = player.get_player_event_channel();
++        let mut connect_state = ConnectState::new(ConnectConfig::default(), &session);
++        connect_state.set_active(true);
++        let task = SpircTask {
++            player,
++            mixer,
++            connect_state,
++            connect_established: false,
++            play_request_id: None,
++            play_status: SpircPlayStatus::Stopped,
++            connection_id_update: Box::pin(futures_util::stream::pending()),
++            connect_state_update: Box::pin(futures_util::stream::pending()),
++            connect_state_volume_update: Box::pin(futures_util::stream::pending()),
++            connect_state_logout_request: Box::pin(futures_util::stream::pending()),
++            playlist_update: Box::pin(futures_util::stream::pending()),
++            session_update: Box::pin(futures_util::stream::pending()),
++            connect_state_command: Box::pin(futures_util::stream::pending()),
++            user_attributes_update: Box::pin(futures_util::stream::pending()),
++            user_attributes_mutation: Box::pin(futures_util::stream::pending()),
++            commands: None,
++            player_events: None,
++            context_resolver: ContextResolver::new(session.clone()),
++            shutdown: false,
++            session,
++            transfer_state: None,
++            update_volume: false,
++            update_state: false,
++            spirc_id: 0,
++            kalinka_bridge: true,
++            kalinka_suspended: false,
++            context_bans_refreshed: None,
++            #[cfg(test)]
++            context_bans_pending: None,
++        };
++
++        (task, events)
++    }
++
++    #[tokio::test]
++    async fn new_play_discards_unfinished_previous_transfer() {
++        use crate::protocol::{
++            context_track::ContextTrack, playback::Playback, session::Session as TransferSession,
++        };
++        let (mut task, _events) = offline_task();
++        let album = "spotify:album:0000000000000000000000";
++        let transfer = TransferState {
++            current_session: MessageField::some(TransferSession {
++                context: MessageField::some(Context {
++                    uri: Some(album.into()),
++                    ..Default::default()
++                }),
++                ..Default::default()
++            }),
++            playback: MessageField::some(Playback {
++                current_track: MessageField::some(ContextTrack {
++                    uri: Some("spotify:local:artist:album:old:180".into()),
++                    ..Default::default()
++                }),
++                position_as_of_timestamp: Some(65000),
++                is_paused: Some(true),
++                ..Default::default()
++            }),
++            ..Default::default()
++        };
++        // A return transfer starts playing before its album context resolves.
++        task.handle_transfer(transfer.clone()).unwrap();
++        assert!(task.transfer_state.is_some());
++        assert!(task.context_resolver.has_next());
++        // Start a new explicit list before that request completes. This uses
++        // the same load path as a playlist Play, without a network fetch.
++        task.handle_load(
++            LoadRequest {
++                context: PlayContext::Tracks(vec!["spotify:local:artist:playlist:new:180".into()]),
++                options: LoadRequestOptions {
++                    start_playing: false,
++                    ..Default::default()
++                },
++            },
++            None,
++            None,
++        )
++        .await
++        .unwrap();
++        assert!(task.transfer_state.is_none());
++        // Old album resolution must not overwrite the new context afterward.
++        let mut old_context = transfer.current_session.context.clone().unwrap();
++        old_context.pages.push(ContextPage {
++            tracks: vec![transfer.playback.current_track.clone().unwrap()],
++            ..Default::default()
++        });
++        task.handle_next_context(Ok(old_context));
++        assert_eq!(task.connect_state.context_uri(), "spotify:web-api");
++        assert_eq!(
++            task.connect_state.current_track(|t| t.uri.as_str()),
++            "spotify:local:artist:playlist:new:180"
++        );
++    }
++
++    #[tokio::test]
++    async fn renderer_volume_updates_connect_state_without_echoing_a_request() {
++        let (mut task, mut events) = offline_task();
++        task.set_volume(16384);
++        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
++            .await
++            .unwrap()
++            .unwrap();
++        assert!(matches!(
++            event,
++            PlayerEvent::VolumeChanged { volume: 16384 }
++        ));
++
++        task.update_volume = false;
++        task.update_reported_volume(32768, false);
++        assert_eq!(task.connect_state.device_info().volume, 32768);
++        assert!(task.update_volume);
++        // An ordinary request queued afterward must be the very next event;
++        // a reflected 32768 would otherwise feed back into the renderer.
++        task.set_volume(0);
++        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
++            .await
++            .unwrap()
++            .unwrap();
++        assert!(matches!(event, PlayerEvent::VolumeChanged { volume: 0 }));
++    }
++
++    #[tokio::test]
++    async fn handoff_stays_selected_ignores_stale_events_and_reloads_on_play() {
++        use crate::protocol::player::ProvidedTrack;
++        let (mut task, mut events) = offline_task();
++        // Missing local file: the real player can exercise the load command
++        // without an account, Spotify network access or audio output.
++        let uri = "spotify:local:artist:album:test:8";
++        let track_id = SpotifyUri::from_uri(uri).unwrap();
++        task.connect_state.set_track(ProvidedTrack {
++            uri: uri.into(),
++            ..Default::default()
++        });
++        task.connect_state.update_duration(8000);
++        task.play_request_id = Some(7);
++        task.play_status = SpircPlayStatus::Playing {
++            nominal_start_time: task.now_ms() - 1500,
++            preloading_of_next_track_triggered: false,
++        };
++        task.handle_kalinka_suspend(1, 1234);
++        assert!(task.connect_state.is_active());
++        assert!(!task.connect_state.is_playing());
++        assert!(task.kalinka_suspended);
++        assert_eq!(task.position(), 1234);
++        for event in [
++            PlayerEvent::Paused {
++                play_request_id: 7,
++                track_id: track_id.clone(),
++                position_ms: 5000,
++            },
++            PlayerEvent::EndOfTrack {
++                play_request_id: 7,
++                track_id: track_id.clone(),
++            },
++        ] {
++            task.handle_player_event(event).await.unwrap();
++        }
++        assert_eq!(task.position(), 1234);
++        // Ordered after the suspend command: no Stopped/Disconnected is emitted.
++        task.player.emit_volume_changed_event(123);
++        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
++            .await
++            .unwrap()
++            .unwrap();
++        assert!(matches!(event, PlayerEvent::VolumeChanged { volume: 123 }));
++        task.handle_seek(4000);
++        assert!(task.kalinka_suspended);
++        assert_eq!(task.position(), 4000);
++        task.handle_play();
++        assert!(!task.kalinka_suspended);
++        assert!(task.connect_state.is_active());
++        assert!(matches!(
++            task.play_status,
++            SpircPlayStatus::LoadingPlay { position_ms: 4000 }
++        ));
++        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
++            .await
++            .unwrap()
++            .unwrap();
++        assert!(matches!(event, PlayerEvent::PlayRequestIdChanged { .. }));
++    }
++
++    #[tokio::test]
++    async fn transfer_to_phone_preserves_position_and_cannot_publish_old_state() {
++        use crate::protocol::player::ProvidedTrack;
++        for paused in [false, true] {
++            let (mut task, mut events) = offline_task();
++            let uri = "spotify:local:artist:album:test:180";
++            let track_id = SpotifyUri::from_uri(uri).unwrap();
++            task.connect_state.set_track(ProvidedTrack {
++                uri: uri.into(),
++                ..Default::default()
++            });
++            task.connect_state.update_duration(180000);
++            task.connect_state.update_position(65000, task.now_ms());
++            task.play_request_id = Some(7);
++            task.play_status = if paused {
++                SpircPlayStatus::Paused {
++                    position_ms: 65000,
++                    preloading_of_next_track_triggered: false,
++                }
++            } else {
++                SpircPlayStatus::Playing {
++                    nominal_start_time: task.now_ms() - 65000,
++                    preloading_of_next_track_triggered: false,
++                }
++            };
++            task.connect_state.set_status(&task.play_status);
++            task.kalinka_suspended = paused;
++            task.update_state = true;
++            task.update_volume = true;
++            let update = ClusterUpdate {
++                cluster: MessageField::some(Cluster {
++                    active_device_id: "phone".into(),
++                    ..Default::default()
++                }),
++                ..Default::default()
++            };
++            // There is deliberately no connected Session: a state PUT or cloud
++            // disconnect during a transfer would fail or time out here.
++            tokio::time::timeout(Duration::from_secs(1), task.handle_cluster_update(update))
++                .await
++                .unwrap()
++                .unwrap();
++            assert!(!task.connect_state.is_active());
++            assert!(!task.update_state && !task.update_volume);
++            assert!(task.play_request_id.is_none());
++            let position = task.connect_state.player().position_as_of_timestamp;
++            assert!((65000..66000).contains(&position));
++            assert_eq!(task.connect_state.current_track(|t| t.uri.clone()), uri);
++            let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
++                .await
++                .unwrap()
++                .unwrap();
++            assert!(matches!(event, PlayerEvent::SessionDisconnected { .. }));
++            for event in [
++                PlayerEvent::Loading {
++                    play_request_id: 7,
++                    track_id: track_id.clone(),
++                    position_ms: 0,
++                },
++                PlayerEvent::PositionCorrection {
++                    play_request_id: 7,
++                    track_id: track_id.clone(),
++                    position_ms: 0,
++                },
++                PlayerEvent::EndOfTrack {
++                    play_request_id: 7,
++                    track_id: track_id.clone(),
++                },
++            ] {
++                task.handle_player_event(event).await.unwrap();
++            }
++            // Even an already scheduled notification must not reach Spotify
++            // after another device owns playback, or reset our saved position.
++            tokio::time::timeout(Duration::from_secs(1), task.notify())
++                .await
++                .unwrap()
++                .unwrap();
++            assert_eq!(
++                task.connect_state.player().position_as_of_timestamp,
++                position
++            );
++            assert!(!task.update_state);
++        }
++    }
++}
+diff --git a/connect/src/state.rs b/connect/src/state.rs
+index b4ee61b..0bd67de 100644
+--- a/connect/src/state.rs
++++ b/connect/src/state.rs
+@@ -107,6 +107,8 @@ impl Default for ConnectConfig {
+ 
+ #[derive(Default, Debug)]
+ pub(super) struct ConnectState {
++    pub(crate) preserve_context_uids: bool,
++    pub(crate) context_bans: crate::context_bans::ContextBans,
+     /// the entire state that is updated to the remote server
+     request: PutStateRequest,
+ 
+@@ -192,6 +194,7 @@ impl ConnectState {
+         };
+ 
+         let mut state = Self {
++            preserve_context_uids: crate::playback::kalinka::active(),
+             request: PutStateRequest {
+                 member_type: EnumOrUnknown::new(MemberType::CONNECT_STATE),
+                 put_state_reason: EnumOrUnknown::new(PutStateReason::PLAYER_STATE_CHANGED),
+diff --git a/connect/src/state/context.rs b/connect/src/state/context.rs
+index 838b104..829de20 100644
+--- a/connect/src/state/context.rs
++++ b/connect/src/state/context.rs
+@@ -469,6 +469,10 @@ impl ConnectState {
+         //  - if no uid is present, resorting doesn't work or behaves not as intended
+         let uid = match ctx_track.uid.as_ref() {
+             Some(uid) if !uid.is_empty() => uid.to_string(),
++            // Spotify may omit item UIDs in albums and generated playlists.
++            // Preserve that absence: an invented UID cannot identify the item
++            // when another client restores the context after a transfer.
++            _ if self.preserve_context_uids => String::new(),
+             // so providing a unique id should allow to resort the queue
+             _ => Uuid::new_v4().as_simple().to_string(),
+         };
+@@ -518,3 +522,140 @@ impl ConnectState {
+         Ok(())
+     }
+ }
++
++#[cfg(test)]
++mod kalinka_identity_tests {
++    use super::*;
++    use crate::{
++        core::{Session, config::SessionConfig},
++        protocol::transfer_state::TransferState,
++        state::ConnectConfig,
++    };
++
++    #[tokio::test]
++    async fn playlist_transfer_preserves_missing_and_supplied_item_uids() {
++        for supplied_uids in [false, true] {
++            let session = Session::new(SessionConfig::default(), None);
++            let mut state = ConnectState::new(ConnectConfig::default(), &session);
++            state.preserve_context_uids = true;
++            let tracks: Vec<_> = (1..=3)
++                .map(|i| ContextTrack {
++                    uri: Some(format!("spotify:track:{i:022}")),
++                    uid: supplied_uids.then(|| format!("spotify-item-{i}")),
++                    ..Default::default()
++                })
++                .collect();
++            let context = Context {
++                uri: Some("spotify:playlist:0000000000000000000000".into()),
++                pages: vec![ContextPage {
++                    tracks: tracks.clone(),
++                    ..Default::default()
++                }],
++                ..Default::default()
++            };
++            state
++                .update_context(context.clone(), ContextType::Default)
++                .unwrap();
++            state.set_current_track(1).unwrap();
++            state.update_position(65000, 100000);
++            // Context resolution during transfer must preserve the same item
++            // identities in the current track and both sides of the queue.
++            state.update_context(context, ContextType::Default).unwrap();
++            state.finish_transfer(TransferState::default()).unwrap();
++            assert_eq!(state.player().index.track, 1);
++            assert_eq!(state.player().position_as_of_timestamp, 65000);
++            assert_eq!(state.prev_tracks().len(), 1);
++            assert_eq!(state.next_tracks().len(), 1);
++            for (provided, original) in [
++                &state.prev_tracks()[0],
++                state.player().track.as_ref().unwrap(),
++                &state.next_tracks()[0],
++            ]
++            .into_iter()
++            .zip(&tracks)
++            {
++                assert_eq!(&provided.uri, original.uri.as_ref().unwrap());
++                assert_eq!(provided.uid, original.uid.as_deref().unwrap_or_default());
++            }
++            // Advancing the queue must also retain Spotify's identity.
++            state.next_track().unwrap();
++            assert_eq!(state.player().index.track, 2);
++            assert_eq!(
++                state.current_track(|t| t.uid.as_str()),
++                tracks[2].uid.as_deref().unwrap_or_default()
++            );
++        }
++    }
++
++    #[tokio::test]
++    async fn album_identity_survives_context_reload_and_transfer_at_nonzero_index() {
++        let session = Session::new(SessionConfig::default(), None);
++        let mut state = ConnectState::new(ConnectConfig::default(), &session);
++        state.preserve_context_uids = true;
++        let album = "spotify:album:0000000000000000000000";
++        let tracks: Vec<_> = [
++            "spotify:track:0000000000000000000001",
++            "spotify:track:0000000000000000000002",
++        ]
++        .iter()
++        .map(|uri| ContextTrack {
++            uri: Some((*uri).into()),
++            ..Default::default()
++        })
++        .collect();
++        for uid in [
++            None,
++            Some(String::new()),
++            Some("spotify-supplied-id".into()),
++        ] {
++            let mut track = tracks[1].clone();
++            track.uid = uid.clone();
++            let first = state
++                .context_to_provided_track(&track, Some(album), Some(1), None, None)
++                .unwrap();
++            let second = state
++                .context_to_provided_track(&track, Some(album), Some(1), None, None)
++                .unwrap();
++            assert_eq!(first.uid, uid.unwrap_or_default());
++            assert_eq!(first.uid, second.uid);
++        }
++        let mut playlist_track = tracks[1].clone();
++        playlist_track.uid = Some("playlist-item-uid".into());
++        assert_eq!(
++            state
++                .context_to_provided_track(
++                    &playlist_track,
++                    Some("spotify:playlist:test"),
++                    Some(1),
++                    None,
++                    None
++                )
++                .unwrap()
++                .uid,
++            "playlist-item-uid"
++        );
++        let context = Context {
++            uri: Some(album.into()),
++            pages: vec![ContextPage {
++                tracks: tracks.clone(),
++                ..Default::default()
++            }],
++            ..Default::default()
++        };
++        state
++            .update_context(context.clone(), ContextType::Default)
++            .unwrap();
++        state.set_current_track(1).unwrap();
++        state.update_position(65000, 100000);
++        // Resolving the context again must not invent different album IDs.
++        state.update_context(context, ContextType::Default).unwrap();
++        state.finish_transfer(TransferState::default()).unwrap();
++        assert_eq!(
++            state.current_track(|t| t.uri.clone()),
++            tracks[1].uri.clone().unwrap()
++        );
++        assert_eq!(state.player().index.track, 1);
++        assert!(state.current_track(|t| t.uid.is_empty()));
++        assert_eq!(state.player().position_as_of_timestamp, 65000);
++    }
++}
+diff --git a/connect/src/state/tracks.rs b/connect/src/state/tracks.rs
+index 8619035..f9f64f0 100644
+--- a/connect/src/state/tracks.rs
++++ b/connect/src/state/tracks.rs
+@@ -15,6 +15,23 @@ use rand::Rng;
+ pub const IDENTIFIER_DELIMITER: &str = "delimiter";
+ 
+ impl<'ct> ConnectState {
++    pub(crate) fn is_context_banned(&self, track: &ProvidedTrack) -> bool {
++        let context = track
++            .get_context_uri()
++            .unwrap_or_else(|| self.context_uri());
++        self.context_bans
++            .get(context)
++            .is_some_and(|tracks| tracks.contains(&track.uri))
++    }
++
++    pub(crate) fn current_track_is_banned(&self) -> bool {
++        self.current_track(|track| {
++            track
++                .as_ref()
++                .is_some_and(|track| self.is_context_banned(track))
++        })
++    }
++
+     fn new_delimiter(iteration: i64) -> ProvidedTrack {
+         let mut delimiter = ProvidedTrack {
+             uri: format!("spotify:{IDENTIFIER_DELIMITER}"),
+@@ -117,13 +134,30 @@ impl<'ct> ConnectState {
+             }
+         }
+ 
++        // Keep original context entries and their UIDs/indices, so refreshing
++        // an unhide can restore an upcoming song without rebuilding the queue.
++        // Bound the scan even when every song is hidden and repeat is enabled.
++        let mut remaining = self.next_tracks().len()
++            + 2 * [ContextType::Default, ContextType::Autoplay]
++                .into_iter()
++                .filter_map(|ty| self.get_context(ty).ok())
++                .map(|ctx| ctx.tracks.len() + 1)
++                .sum::<usize>()
++            + 1;
+         let new_track = loop {
++            if remaining == 0 {
++                break None;
++            }
++            remaining -= 1;
++            if self.next_tracks().is_empty() {
++                self.fill_up_next_tracks()?;
++            }
+             match self.get_next_track() {
+                 Some(next) if next.uid.starts_with(IDENTIFIER_DELIMITER) => {
+                     self.push_prev(next);
+                     continue;
+                 }
+-                Some(next) if next.is_unavailable() => continue,
++                Some(next) if next.is_unavailable() || self.is_context_banned(&next) => continue,
+                 other => break other,
+             };
+         };
+@@ -197,9 +231,13 @@ impl<'ct> ConnectState {
+             let _ = self.next_tracks_mut().pop();
+         }
+ 
+-        let new_track = match self.prev_tracks_mut().pop() {
+-            None => return Ok(None),
+-            Some(t) => t,
++        let new_track = loop {
++            match self.prev_tracks_mut().pop() {
++                None => return Ok(None),
++                Some(t) if t.uid.starts_with(IDENTIFIER_DELIMITER) => continue,
++                Some(t) if t.is_unavailable() || self.is_context_banned(&t) => continue,
++                Some(t) => break t,
++            }
+         };
+ 
+         if matches!(self.active_context, ContextType::Autoplay if new_track.is_context()) {
+@@ -208,9 +246,12 @@ impl<'ct> ConnectState {
+         }
+ 
+         self.fill_up_next_tracks()?;
++        let context_index = new_track.get_context_index();
+         self.set_track(new_track);
+ 
+-        if self.player().index.track == 0 {
++        if let Some(index) = context_index {
++            self.update_current_index(|i| i.track = index as u32);
++        } else if self.player().index.track == 0 {
+             warn!("prev: trying to skip into negative, index update skipped")
+         } else {
+             self.update_current_index(|i| i.track -= 1)
+@@ -353,10 +394,18 @@ impl<'ct> ConnectState {
+     }
+ 
+     pub fn preview_next_track(&mut self) -> Option<SpotifyUri> {
+-        let next = if self.repeat_track() {
++        let next = if self.repeat_track() && !self.current_track_is_banned() {
+             self.current_track(|t| &t.uri)
+         } else {
+-            &self.next_tracks().first()?.uri
++            &self
++                .next_tracks()
++                .iter()
++                .find(|t| {
++                    !t.uid.starts_with(IDENTIFIER_DELIMITER)
++                        && !t.is_unavailable()
++                        && !self.is_context_banned(t)
++                })?
++                .uri
+         };
+ 
+         SpotifyUri::from_uri(next).ok()
+@@ -437,3 +486,113 @@ impl<'ct> ConnectState {
+         self.update_restrictions();
+     }
+ }
++
++#[cfg(test)]
++mod kalinka_hidden_tests {
++    use super::*;
++    use crate::{
++        core::{Session, config::SessionConfig},
++        protocol::{context::Context, context_page::ContextPage, context_track::ContextTrack},
++        state::ConnectConfig,
++    };
++
++    const CONTEXT: &str = "spotify:playlist:test";
++    fn uri(index: usize) -> String {
++        format!("spotify:track:{index:022}")
++    }
++
++    fn state(count: usize) -> ConnectState {
++        let session = Session::new(SessionConfig::default(), None);
++        let mut state = ConnectState::new(ConnectConfig::default(), &session);
++        state.preserve_context_uids = true;
++        state
++            .update_context(
++                Context {
++                    uri: Some(CONTEXT.into()),
++                    pages: vec![ContextPage {
++                        tracks: (0..count)
++                            .map(|i| ContextTrack {
++                                uri: Some(uri(i)),
++                                uid: Some(format!("original-{i}")),
++                                ..Default::default()
++                            })
++                            .collect(),
++                        ..Default::default()
++                    }],
++                    ..Default::default()
++                },
++                ContextType::Default,
++            )
++            .unwrap();
++        state.set_current_track(0).unwrap();
++        state.reset_playback_to_position(Some(0)).unwrap();
++        state
++    }
++
++    fn hide(state: &mut ConnectState, indices: impl Iterator<Item = usize>) {
++        state
++            .context_bans
++            .insert(CONTEXT.into(), indices.map(uri).collect());
++    }
++
++    #[tokio::test]
++    async fn skips_hidden_next_previous_and_preload_without_changing_identity() {
++        let mut state = state(4);
++        hide(&mut state, [1].into_iter());
++        assert_eq!(
++            state.preview_next_track().unwrap().to_uri().unwrap(),
++            uri(2)
++        );
++        assert_eq!(state.next_track().unwrap(), Some(2));
++        assert_eq!(state.current_track(|t| t.uid.as_str()), "original-2");
++        state.reset_playback_to_position(Some(2)).unwrap();
++        state.prev_track().unwrap().unwrap();
++        assert_eq!(state.player().index.track, 0);
++        assert_eq!(state.current_track(|t| t.uid.as_str()), "original-0");
++        assert_eq!(
++            state
++                .get_context(ContextType::Default)
++                .unwrap()
++                .tracks
++                .len(),
++            4
++        );
++    }
++
++    #[tokio::test]
++    async fn unhide_restores_upcoming_song_and_ban_is_context_specific() {
++        let mut state = state(3);
++        hide(&mut state, [1].into_iter());
++        let mut other_context = state.next_tracks()[0].clone();
++        other_context.set_context_uri("spotify:album:other");
++        assert!(!state.is_context_banned(&other_context));
++        assert!(state.is_context_banned(&state.next_tracks()[0]));
++        state.context_bans.clear();
++        assert_eq!(
++            state.preview_next_track().unwrap().to_uri().unwrap(),
++            uri(1)
++        );
++        assert_eq!(state.next_track().unwrap(), Some(1));
++    }
++
++    #[tokio::test]
++    async fn skips_more_than_one_queue_window() {
++        let mut state = state(110);
++        hide(&mut state, 1..100);
++        assert_eq!(state.next_track().unwrap(), Some(100));
++        assert_eq!(state.current_track(|t| t.uid.as_str()), "original-100");
++    }
++
++    #[tokio::test]
++    async fn repeat_skips_hidden_tracks_and_all_hidden_repeat_terminates() {
++        let mut state = state(3);
++        state.set_repeat_context(true);
++        state.set_current_track(2).unwrap();
++        state.reset_playback_to_position(Some(2)).unwrap();
++        hide(&mut state, [0].into_iter());
++        assert_eq!(state.next_track().unwrap(), Some(1));
++        hide(&mut state, 0..3);
++        assert_eq!(state.next_track().unwrap(), None);
++        assert!(state.current_track(MessageField::is_none));
++    }
++}
+diff --git a/connect/src/state/transfer.rs b/connect/src/state/transfer.rs
+index e91ec5f..70e60cf 100644
+--- a/connect/src/state/transfer.rs
++++ b/connect/src/state/transfer.rs
+@@ -138,7 +138,9 @@ impl ConnectState {
+         let current_index = match transfer.current_session.current_uid.as_ref() {
+             Some(uid) if track.is_queue() => Self::find_index_in_context(ctx, |c| &c.uid == uid)
+                 .map(|i| if i > 0 { i - 1 } else { i }),
+-            _ => Self::find_index_in_context(ctx, |c| c.uri == track.uri || c.uid == track.uid),
++            _ => Self::find_index_in_context(ctx, |c| {
++                c.uri == track.uri || (!track.uid.is_empty() && c.uid == track.uid)
++            }),
+         };
+ 
+         debug!(
+diff --git a/playback/Cargo.toml b/playback/Cargo.toml
+index e5656ad..d71eba7 100644
+--- a/playback/Cargo.toml
++++ b/playback/Cargo.toml
+@@ -53,6 +53,7 @@ librespot-metadata = { version = "0.8.0", path = "../metadata", default-features
+ 
+ futures-util = { version = "0.3", default-features = false, features = ["std"] }
+ log = "0.4"
++serde_json = "1"
+ portable-atomic = "1"
+ shell-words = "1.1"
+ thiserror = "2"
+diff --git a/playback/src/audio_backend/pipe.rs b/playback/src/audio_backend/pipe.rs
+index 8dfd21e..77741ff 100644
+--- a/playback/src/audio_backend/pipe.rs
++++ b/playback/src/audio_backend/pipe.rs
+@@ -98,11 +98,16 @@ impl Sink for StdoutSink {
+ impl SinkAsBytes for StdoutSink {
+     #[inline]
+     fn write_bytes(&mut self, data: &[u8]) -> SinkResult<()> {
+-        self.output
+-            .as_deref_mut()
+-            .ok_or(StdoutError::NoOutput)?
+-            .write_all(data)
+-            .map_err(StdoutError::OnWrite)?;
++        let output = self.output.as_deref_mut().ok_or(StdoutError::NoOutput)?;
++        output.write_all(data).map_err(StdoutError::OnWrite)?;
++
++        // Stdout is line buffered even when redirected to a pipe. The bridge
++        // waits for acknowledgement before writing another packet, so its
++        // supervisor must receive every announced byte now, including any
++        // suffix after the final newline.
++        if crate::kalinka::active() {
++            output.flush().map_err(StdoutError::FlushFailure)?;
++        }
+ 
+         Ok(())
+     }
+diff --git a/playback/src/decoder/passthrough_decoder.rs b/playback/src/decoder/passthrough_decoder.rs
+index ec05f71..0c06169 100644
+--- a/playback/src/decoder/passthrough_decoder.rs
++++ b/playback/src/decoder/passthrough_decoder.rs
+@@ -91,6 +91,10 @@ impl<R: Read + Seek> AudioDecoder for PassthroughDecoder<R> {
+     fn seek(&mut self, position_ms: u32) -> Result<u32, DecoderError> {
+         let absgp = (position_ms as f64 * PAGES_PER_MS) as u64;
+ 
++        if crate::kalinka::active() {
++            self.wtr = PacketWriter::new(Vec::new());
++            self.bos = false;
++        }
+         // add an eos to previous stream if missing
+         if self.bos && !self.eos {
+             match self.rdr.read_packet() {
+diff --git a/playback/src/kalinka.rs b/playback/src/kalinka.rs
+new file mode 100644
+index 0000000..76a4fce
+--- /dev/null
++++ b/playback/src/kalinka.rs
+@@ -0,0 +1,207 @@
++//! Private, opt-in Kalinka pipe bridge. No audio hardware or Spotify protocol here.
++use crate::{decoder::AudioPacket, player::PlayerEvent};
++use futures_util::task::AtomicWaker;
++use serde_json::{Value, json};
++use std::{
++    io::{BufRead, BufReader, Write},
++    os::fd::FromRawFd,
++    os::unix::net::UnixStream,
++    sync::{
++        Mutex, OnceLock,
++        atomic::{AtomicBool, AtomicU64, Ordering},
++    },
++    task::Context,
++    time::Duration,
++};
++
++struct Bridge {
++    output: Mutex<UnixStream>,
++    sent: AtomicU64,
++    ack: AtomicU64,
++    waker: AtomicWaker,
++}
++static BRIDGE: OnceLock<Bridge> = OnceLock::new();
++static EPOCH: AtomicU64 = AtomicU64::new(0);
++pub fn epoch() -> u64 {
++    EPOCH.load(Ordering::SeqCst)
++}
++static ACTIVE: AtomicBool = AtomicBool::new(false);
++pub fn active() -> bool {
++    ACTIVE.load(Ordering::SeqCst)
++}
++
++pub fn init() -> tokio::sync::mpsc::Receiver<Value> {
++    let (tx, rx) = tokio::sync::mpsc::channel(32);
++    let Ok(fd) = std::env::var("KALINKA_CONTROL_FD") else {
++        return rx;
++    };
++    ACTIVE.store(true, Ordering::SeqCst);
++    let fd: i32 = fd.parse().expect("invalid control descriptor");
++    // The supervisor transfers ownership of this inherited socket descriptor.
++    let socket = unsafe { UnixStream::from_raw_fd(fd) };
++    socket
++        .set_write_timeout(Some(Duration::from_secs(2)))
++        .unwrap();
++    let input = socket.try_clone().unwrap();
++    BRIDGE
++        .set(Bridge {
++            output: Mutex::new(socket),
++            sent: AtomicU64::new(0),
++            ack: AtomicU64::new(0),
++            waker: AtomicWaker::new(),
++        })
++        .ok()
++        .expect("one bridge");
++    std::thread::spawn(move || {
++        let mut input = BufReader::new(input);
++        loop {
++            let mut line = String::new();
++            // Commands are tiny; a malicious/broken supervisor cannot grow memory.
++            let mut limited = (&mut input).take(4096);
++            use std::io::Read;
++            if limited.read_line(&mut line).unwrap_or(0) == 0 || !line.ends_with('\n') {
++                std::process::exit(70);
++            }
++            let Ok(value) = serde_json::from_str::<Value>(&line) else {
++                std::process::exit(70)
++            };
++            if value["op"] == "ack" {
++                let b = BRIDGE.get().unwrap();
++                let ack = value["id"].as_u64().unwrap_or(0);
++                if ack <= b.sent.load(Ordering::SeqCst) {
++                    b.ack.fetch_max(ack, Ordering::SeqCst);
++                    b.waker.wake();
++                }
++            } else if tx.blocking_send(value).is_err() {
++                return;
++            }
++        }
++    });
++    emit(json!({"event":"ready", "protocol":1}));
++    rx
++}
++
++pub fn emit(mut value: Value) {
++    value["epoch"] = json!(epoch());
++    if let Some(b) = BRIDGE.get() {
++        let mut out = b.output.lock().unwrap();
++        if serde_json::to_writer(&mut *out, &value).is_err() || out.write_all(b"\n").is_err() {
++            std::process::exit(70);
++        }
++    }
++}
++
++pub fn poll_ready(cx: &Context<'_>) -> bool {
++    let Some(b) = BRIDGE.get() else { return true };
++    b.waker.register(cx.waker());
++    b.ack.load(Ordering::SeqCst) >= b.sent.load(Ordering::SeqCst)
++}
++
++fn reset_credit() {
++    EPOCH.fetch_add(1, Ordering::SeqCst);
++    if let Some(b) = BRIDGE.get() {
++        b.ack.store(b.sent.load(Ordering::SeqCst), Ordering::SeqCst);
++        b.waker.wake();
++    }
++}
++
++pub fn packet(packet: &AudioPacket, position_ms: u32) {
++    if let Some(b) = BRIDGE.get() {
++        let AudioPacket::Raw(data) = packet else {
++            emit(json!({"event":"error", "code":"incompatible_format"}));
++            std::process::exit(71);
++        };
++        if data.len() > 1024 * 1024 {
++            std::process::exit(71);
++        }
++        let id = b.sent.fetch_add(1, Ordering::SeqCst) + 1;
++        emit(json!({"event":"packet", "id":id, "length":data.len(), "position_ms":position_ms}));
++    }
++}
++
++pub fn suspended(id: u64) {
++    reset_credit();
++    emit(json!({"event":"suspended", "id":id}));
++}
++
++pub fn event(event: &PlayerEvent) {
++    if BRIDGE.get().is_none() {
++        return;
++    }
++    use PlayerEvent::*;
++    let value = match event {
++        Loading { position_ms, .. } => {
++            reset_credit();
++            json!({"event":"loading", "position_ms":position_ms})
++        }
++        Seeked { position_ms, .. } => {
++            reset_credit();
++            json!({"event":"seeked", "position_ms":position_ms})
++        }
++        Playing { position_ms, .. } => json!({"event":"playing", "position_ms":position_ms}),
++        Paused { position_ms, .. } => json!({"event":"paused", "position_ms":position_ms}),
++        VolumeChanged { volume } => json!({"event":"volume", "volume":volume}),
++        Stopped { .. } => json!({"event":"stopped"}),
++        EndOfTrack { .. } => json!({"event":"end"}),
++        Unavailable { .. } => json!({"event":"error", "code":"track_unavailable"}),
++        SessionConnected { .. } => json!({"event":"connected"}),
++        SessionDisconnected { .. } => json!({"event":"disconnected"}),
++        TrackChanged { audio_item: item } => {
++            reset_credit();
++            use crate::metadata::audio::UniqueFields;
++            let (album, artists) = match &item.unique_fields {
++                UniqueFields::Track { album, artists, .. } => (
++                    album.clone(),
++                    artists
++                        .iter()
++                        .map(|a| a.name.clone())
++                        .collect::<Vec<_>>()
++                        .join(", "),
++                ),
++                UniqueFields::Episode { show_name, .. } => (show_name.clone(), String::new()),
++                _ => (String::new(), String::new()),
++            };
++            json!({"event":"track", "uri":item.uri, "title":item.name,
++                "duration_ms":item.duration_ms, "album":album, "artist":artists,
++                "cover":item.covers.first().map(|c| &c.url)})
++        }
++        _ => return,
++    };
++    emit(value);
++}
++
++/// Offline verification of the actual compiled decoder and pipe backend.
++#[cfg(feature = "passthrough-decoder")]
++pub fn self_test(path: &str, seek: Option<u32>) {
++    ACTIVE.store(true, Ordering::SeqCst);
++    let _commands = init();
++    use crate::metadata::audio::AudioFileFormat;
++    use crate::{
++        audio_backend,
++        config::AudioFormat,
++        convert::Converter,
++        decoder::{AudioDecoder, PassthroughDecoder},
++    };
++    let input = std::fs::File::open(path).expect("fixture");
++    let mut decoder = PassthroughDecoder::new(input, AudioFileFormat::OGG_VORBIS_160).unwrap();
++    if let Some(position) = seek {
++        decoder.next_packet().unwrap();
++        decoder.seek(position).unwrap();
++    }
++    let mut sink = audio_backend::find(Some("pipe".into())).unwrap()(None, AudioFormat::S16);
++    let mut converter = Converter::new(None);
++    sink.start().unwrap();
++    while let Some((position, audio)) = decoder.next_packet().unwrap() {
++        packet(&audio, position.position_ms);
++        sink.write(audio, &mut converter).unwrap();
++        // Exercise the same packet/credit contract as live playback when
++        // the verifier supplies a control socket. No next write or final
++        // stop/exit may flush bytes the supervisor still needs to acknowledge.
++        if let Some(b) = BRIDGE.get() {
++            while b.ack.load(Ordering::SeqCst) < b.sent.load(Ordering::SeqCst) {
++                std::thread::sleep(Duration::from_millis(1));
++            }
++        }
++    }
++    sink.stop().unwrap();
++}
+diff --git a/playback/src/lib.rs b/playback/src/lib.rs
+index a637f00..2c3ff93 100644
+--- a/playback/src/lib.rs
++++ b/playback/src/lib.rs
+@@ -10,6 +10,7 @@ pub mod config;
+ pub mod convert;
+ pub mod decoder;
+ pub mod dither;
++pub mod kalinka;
+ mod local_file;
+ pub mod mixer;
+ pub mod player;
+diff --git a/playback/src/player.rs b/playback/src/player.rs
+index 9c09be5..cc1a72a 100644
+--- a/playback/src/player.rs
++++ b/playback/src/player.rs
+@@ -112,6 +112,8 @@ enum PlayerCommand {
+     Pause,
+     Stop,
+     Seek(u32),
++    ReportPosition(u32),
++    KalinkaSuspend(u64),
+     SetSession(Session),
+     AddEventSender(mpsc::UnboundedSender<PlayerEvent>),
+     SetSinkEventCallback(Option<SinkEventCallback>),
+@@ -565,6 +567,16 @@ impl Player {
+         self.command(PlayerCommand::Stop)
+     }
+ 
++    /// Renderer feedback changes the Connect clock, never the capture cursor.
++    pub fn report_position(&self, position_ms: u32) {
++        self.command(PlayerCommand::ReportPosition(position_ms));
++    }
++
++    /// Retire the output decoder without ending the Connect session.
++    pub fn kalinka_suspend(&self, id: u64) {
++        self.command(PlayerCommand::KalinkaSuspend(id));
++    }
++
+     pub fn seek(&self, position_ms: u32) {
+         self.command(PlayerCommand::Seek(position_ms));
+     }
+@@ -1421,6 +1433,13 @@ impl Future for PlayerInternal {
+                 }
+             }
+ 
++            if self.state.is_playing() && !crate::kalinka::poll_ready(cx) {
++                // Commands/loads above remain polled while audio awaits credit.
++                if all_futures_completed_or_not_ready {
++                    return Poll::Pending;
++                }
++                continue;
++            }
+             if self.state.is_playing() {
+                 self.ensure_sink_running();
+ 
+@@ -1741,7 +1760,7 @@ impl PlayerInternal {
+         normalisation_factor: f64,
+     ) {
+         match packet {
+-            Some((_, mut packet)) => {
++            Some((position, mut packet)) => {
+                 if !packet.is_empty() {
+                     if let AudioPacket::Samples(ref mut data) = packet {
+                         // Get the volume for the packet. In the case of hardware volume control
+@@ -1836,6 +1855,7 @@ impl PlayerInternal {
+                         }
+                     }
+ 
++                    crate::kalinka::packet(&packet, position.position_ms);
+                     if let Err(e) = self.sink.write(packet, &mut self.converter) {
+                         error!("{e}");
+                         self.handle_pause();
+@@ -2277,6 +2297,25 @@ impl PlayerInternal {
+             PlayerCommand::Preload { track_id } => self.handle_command_preload(track_id),
+ 
+             PlayerCommand::Seek(position_ms) => self.handle_command_seek(position_ms)?,
++            PlayerCommand::ReportPosition(position_ms) => {
++                if let PlayerState::Playing {
++                    ref track_id,
++                    play_request_id,
++                    ..
++                }
++                | PlayerState::Paused {
++                    ref track_id,
++                    play_request_id,
++                    ..
++                } = self.state
++                {
++                    self.send_event(PlayerEvent::PositionCorrection {
++                        track_id: track_id.clone(),
++                        play_request_id,
++                        position_ms,
++                    });
++                }
++            }
+ 
+             PlayerCommand::Play => self.handle_play(),
+ 
+@@ -2284,6 +2323,16 @@ impl PlayerInternal {
+ 
+             PlayerCommand::Stop => self.handle_player_stop(),
+ 
++            PlayerCommand::KalinkaSuspend(id) => {
++                // Serialized with packet writes: everything before the marker
++                // belongs to the retired HTTP resource. Do not emit Stopped,
++                // since Connect must stay selected and paused at its position.
++                self.ensure_sink_stopped(false);
++                self.state = PlayerState::Stopped;
++                self.preload = PlayerPreload::None;
++                crate::kalinka::suspended(id);
++            }
++
+             PlayerCommand::SetSession(session) => self.session = session,
+ 
+             PlayerCommand::AddEventSender(sender) => self.event_senders.push(sender),
+@@ -2329,10 +2378,18 @@ impl PlayerInternal {
+             PlayerCommand::EmitSessionDisconnectedEvent {
+                 connection_id,
+                 user_name,
+-            } => self.send_event(PlayerEvent::SessionDisconnected {
+-                connection_id,
+-                user_name,
+-            }),
++            } => {
++                if crate::kalinka::active() {
++                    // The HTTP resource has been retired. A later Connect
++                    // activation must load fresh headers, even for this track.
++                    self.handle_player_stop();
++                    self.preload = PlayerPreload::None;
++                }
++                self.send_event(PlayerEvent::SessionDisconnected {
++                    connection_id,
++                    user_name,
++                });
++            }
+ 
+             PlayerCommand::SetAutoNormaliseAsAlbum(setting) => {
+                 self.auto_normalise_as_album = setting
+@@ -2375,6 +2432,7 @@ impl PlayerInternal {
+     }
+ 
+     fn send_event(&mut self, event: PlayerEvent) {
++        crate::kalinka::event(&event);
+         self.event_senders
+             .retain(|sender| sender.send(event.clone()).is_ok());
+     }
+@@ -2481,6 +2539,12 @@ impl fmt::Debug for PlayerCommand {
+             PlayerCommand::Pause => f.debug_tuple("Pause").finish(),
+             PlayerCommand::Stop => f.debug_tuple("Stop").finish(),
+             PlayerCommand::Seek(position) => f.debug_tuple("Seek").field(&position).finish(),
++            PlayerCommand::ReportPosition(position) => {
++                f.debug_tuple("ReportPosition").field(&position).finish()
++            }
++            PlayerCommand::KalinkaSuspend(id) => {
++                f.debug_tuple("KalinkaSuspend").field(&id).finish()
++            }
+             PlayerCommand::SetSession(_) => f.debug_tuple("SetSession").finish(),
+             PlayerCommand::AddEventSender(_) => f.debug_tuple("AddEventSender").finish(),
+             PlayerCommand::SetSinkEventCallback(_) => {
+diff --git a/src/main.rs b/src/main.rs
+index fb85803..13e8b77 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1879,6 +1879,21 @@ async fn set_env_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
+ 
+ #[tokio::main(flavor = "current_thread")]
+ async fn main() {
++    if env::args().any(|a| a == "--kalinka-capabilities") {
++        println!(
++            "{{\"protocol\":1,\"librespot\":\"0.8.0\",\"passthrough\":{},\"pipe\":true,\"volume\":true,\"reconnect\":true,\"suspend\":true}}",
++            cfg!(feature = "passthrough-decoder")
++        );
++        return;
++    }
++    #[cfg(feature = "passthrough-decoder")]
++    if let Some(index) = env::args().position(|a| a == "--kalinka-self-test") {
++        let path = env::args().nth(index + 1).expect("fixture path");
++        let seek = env::args().nth(index + 2).and_then(|v| v.parse().ok());
++        librespot::playback::kalinka::self_test(&path, seek);
++        return;
++    }
++    let mut kalinka_commands = librespot::playback::kalinka::init();
+     const RUST_BACKTRACE: &str = "RUST_BACKTRACE";
+     const RECONNECT_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(600);
+     const DISCOVERY_RETRY_TIMEOUT: Duration = Duration::from_secs(10);
+@@ -2007,6 +2022,32 @@ async fn main() {
+ 
+     loop {
+         tokio::select! {
++            Some(command) = kalinka_commands.recv() => {
++                if command["op"] == "progress" && command["epoch"].as_u64() == Some(librespot::playback::kalinka::epoch()) {
++                    player.report_position(command["position_ms"].as_u64().unwrap_or(0) as u32);
++                    continue;
++                }
++                if let Some(s) = &spirc {
++                    let result = match command["op"].as_str().unwrap_or("") {
++                        "pause" => s.pause(), "resume" => s.play(),
++                        "next" => s.next(), "prev" => s.prev(),
++                        "seek" => s.set_position_ms(command["position_ms"].as_u64().unwrap_or(0) as u32),
++                        "volume" => match command["volume"].as_u64().and_then(|v| u16::try_from(v).ok()) {
++                            Some(volume) => s.report_volume(volume),
++                            None => continue,
++                        },
++                        "disconnect" => s.disconnect(true),
++                        "suspend" => match (command["id"].as_u64(), command["position_ms"].as_u64().and_then(|v| u32::try_from(v).ok())) {
++                            (Some(id), Some(position_ms)) => s.kalinka_suspend(id, position_ms),
++                            _ => continue,
++                        },
++                        _ => continue,
++                    };
++                    if result.is_err() {
++                        librespot::playback::kalinka::emit(serde_json::json!({"event":"error", "code":"control_failed"}));
++                    }
++                }
++            },
+             credentials = async {
+                 match discovery.as_mut() {
+                     Some(d) => d.next().await,
+@@ -2054,6 +2095,7 @@ async fn main() {
+                                                                 mixer.clone()).await {
+                     Ok((spirc_, spirc_task_)) => (spirc_, spirc_task_),
+                     Err(e) => {
++                        librespot::playback::kalinka::emit(serde_json::json!({"event":"error", "code":"authentication_failed"}));
+                         error!("could not initialize spirc: {e}");
+                         exit(1);
+                     }

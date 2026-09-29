@@ -1,0 +1,32 @@
+Spotify Connect plugin for Kalinka
+=================================
+
+This architecture-independent package installs the Python wheel under
+/opt/kalinka/wheels. The kalinka-server-restart dpkg trigger asks the server
+to restart; Kalinka's bootstrap then installs the wheel into its managed
+environment. The plugin is disabled by default.
+
+Before enabling Spotify:
+
+* Install the matching SDK 3.5, server and renderer streaming support described
+  in docs/core-compatibility.md in the source repository. SDK 3.5 alone is not
+  sufficient; the server and renderer must support unfinished HTTP streams.
+* Build/install librespot 0.8.0 with the Kalinka pipe bridge for the server's
+  architecture, then set Spotify's executable setting to its absolute path.
+  scripts/build-librespot.sh builds the pinned implementation, and
+  scripts/verify-librespot.py verifies its output. A stock librespot executable
+  is incompatible. The capability probe must include "volume": true,
+  "reconnect": true and "suspend": true for volume sync and resuming after a
+  queue handoff while keeping Kalinka selected in Spotify;
+  rebuild older bridge versions when upgrading.
+  This .deb contains the Python plugin, not a native binary.
+* Select a renderer through Kalinka, enable Spotify Connect, and pair using
+  the Spotify app with a Premium account.
+
+Removal uninstalls the plugin from /opt/kalinka/venv using Kalinka's standard
+prerm hook. Upgrades leave the existing installation in place until bootstrap
+installs the new wheel. The package does not delete account credentials or
+configuration, and it does not install a separate Spotify systemd service.
+
+Build and operation instructions:
+https://github.com/Kalinka-Player/kalinka-plugin-spotify

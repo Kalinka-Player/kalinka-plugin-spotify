@@ -1,0 +1,65 @@
+name: Tests
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  python:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Kalinka-Player/KalinkaPlayer
+          ref: 6162c0b0625bb41c2cb72d9c0509d6e0585b6057
+          path: core
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Install companion core and plugin
+        run: |
+          git -C core apply ../patches/kalinka-core-3.5.patch
+          python -m pip install -e core/packages/kalinka-plugin-sdk -e core/packages/kalinka-server -e '.[dev]'
+      - run: python -m ruff check src tests scripts
+      - run: python -m ruff format --check src tests scripts
+      - run: python -m pytest
+      - run: python -m build
+      - name: Build and inspect Debian package
+        run: |
+          ./scripts/build_deb.sh
+          dpkg-deb --info kalinka-plugin-spotify_*_all.deb
+          dpkg-deb --contents kalinka-plugin-spotify_*_all.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kalinka-plugin-spotify-deb
+          path: kalinka-plugin-spotify_*_all.deb
+          if-no-files-found: error
+  librespot:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Kalinka-Player/KalinkaPlayer
+          ref: 6162c0b0625bb41c2cb72d9c0509d6e0585b6057
+          path: core
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build pinned executable
+        run: ./scripts/build-librespot.sh
+      - name: Test Connect controls, transfers and hidden songs
+        run: >-
+          cargo test --locked --manifest-path build/librespot/Cargo.toml
+          -p librespot-connect --no-default-features
+          --features rustls-tls-native-roots --lib kalinka_
+      - name: Verify actual pipe output and seek
+        run: |
+          git -C core apply ../patches/kalinka-core-3.5.patch
+          python -m pip install -e core/packages/kalinka-plugin-sdk
+          python scripts/verify-librespot.py build/librespot/target/release/librespot
