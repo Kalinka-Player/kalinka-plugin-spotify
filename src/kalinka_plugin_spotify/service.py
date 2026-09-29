@@ -147,8 +147,11 @@ class Service:
         returncode = await self.producer.wait()
         if self.closed:
             return
-        self.error = self.status = f"librespot exited (status {returncode})."
-        logger.error("Spotify Connect: %s", self.error)
+        # librespot exits right after reporting errors such as a refused
+        # sign-in; keep that reason for the status and retry policy.
+        if self.error is None:
+            self.error = self.status = f"librespot exited (status {returncode})."
+            logger.error("Spotify Connect: %s", self.error)
         if self.task:
             self.task.cancel()
 

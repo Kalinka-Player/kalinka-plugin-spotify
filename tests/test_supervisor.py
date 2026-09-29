@@ -185,9 +185,13 @@ async def test_signin_failures_keep_retrying_with_slow_backoff(
         )
         sessions[index].producer.signin_errors = signin_errors
         sessions[index].producer.incoming.put_nowait({"event": "error", "code": code})
+        # librespot exits right after reporting; the reason must survive. The
+        # event handler wakes first, then the exit watcher, as in live logs.
+        sessions[index].producer.exited.set_result(1)
         await wait_until(lambda: len(sessions) > index + 1 or supervisor.retrying)
         if index == 0:
             assert "sign-in" in supervisor.status and "retrying" in supervisor.status
+            assert "exited" not in supervisor.status
             assert supervisor.error is None
         await wait_until(lambda: len(sessions) > index + 1)
     delays = [
