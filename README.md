@@ -41,6 +41,12 @@ curl -fsSL https://raw.githubusercontent.com/Kalinka-Player/kalinka-plugin-spoti
 
 The script picks the package for the machine's architecture, checks it against the release's `SHA256SUMS` and installs it with apt; the server restarts to load it. The package bundles the patched librespot, so nothing needs building. Then set a device name, enable Spotify Connect in Kalinka's settings and select a renderer through Kalinka's usual output selector. The Spotify device name identifies the Connect receiver; output selection stays in Kalinka's normal renderer selector.
 
+On Fedora 44 or newer with the `kalinka-server` RPM, download the package for the machine's architecture (`x86_64` or `aarch64`) from the [latest release](https://github.com/Kalinka-Player/kalinka-plugin-spotify/releases/latest), check it with `sha256sum -c SHA256SUMS --ignore-missing`, and install it with dnf; the server restarts to load it. The install script above supports apt-based systems only.
+
+```sh
+sudo dnf install ./kalinka-plugin-spotify-*.fc44.x86_64.rpm
+```
+
 ### From source
 
 Build the pinned executable and verify it:
@@ -138,11 +144,20 @@ sudo apt install ./kalinka-plugin-spotify_*_$(dpkg --print-architecture).deb
 
 Build requirements are Python 3.11+, the Python `build` module, `dpkg-dev` and binutils, plus the librespot toolchain above. The version comes from the newest `kalinka-plugin-spotify-v*` tag via setuptools-scm, so build from a clone with its tags; an untagged commit builds a `~dev` version that sorts before the next release. The `.deb` is written in the repository root. Existing `dist/` artifacts are preserved.
 
+The Fedora RPM ([`rpm/kalinka-plugin-spotify.spec`](rpm/kalinka-plugin-spotify.spec)) installs the same files. Instead of the dpkg trigger, its scriptlets restart `kalinka.service` after install, upgrade and removal, and removal uninstalls the plugin from the venv. Build it on the Fedora release it targets, which sets the dist tag and glibc floor, with `rpm-build` and binutils:
+
+```sh
+PYTHON=.venv/bin/python ./scripts/build_rpm.sh build/librespot/target/release/librespot
+sudo dnf install ./kalinka-plugin-spotify-*.rpm
+```
+
+The RPM requires `kalinka-server`, which bundles the SDK, plus Python `>=3.11` and CA certificates; rpmbuild adds librespot's library requirements.
+
 The package depends on `kalinka-server`, SDK `>=3.5,<4`, Python `>=3.11` and CA certificates. The companion server and renderer changes are also required; installing this plugin package does not upgrade their streaming implementation.
 
 ### Releasing
 
-Push a `kalinka-plugin-spotify-vX.Y.Z` tag. The Release workflow runs the tests, builds librespot and the `.deb` natively on amd64 and arm64 runners inside a Debian 12 container, verifies each executable's pipe output, and publishes both packages with `SHA256SUMS` to a GitHub release marked latest, which `install-latest.sh` installs. A `## X.Y.Z` section in `CHANGELOG.md`, if present, leads the release notes. To rebuild an existing tag, run the workflow by hand with that tag.
+Push a `kalinka-plugin-spotify-vX.Y.Z` tag. The Release workflow runs the tests, then builds librespot natively on amd64 and arm64 runners twice: in a Debian 12 container for the `.deb`, and in a Fedora 44 container for the `.rpm`. It verifies each executable's pipe output and publishes all four packages with `SHA256SUMS` to a GitHub release marked latest, which `install-latest.sh` installs on apt-based systems. A `## X.Y.Z` section in `CHANGELOG.md`, if present, leads the release notes. To rebuild an existing tag, run the workflow by hand with that tag.
 
 ## Pairing and credentials
 
