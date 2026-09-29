@@ -1,0 +1,1164 @@
+diff --git a/packages/kalinka-plugin-sdk/README.md b/packages/kalinka-plugin-sdk/README.md
+index 83b90bd..16bfcf4 100644
+--- a/packages/kalinka-plugin-sdk/README.md
++++ b/packages/kalinka-plugin-sdk/README.md
+@@ -76,6 +76,8 @@ class MyDevice(ExternalOutputDevice):
+ - `PluginContext`: Context provided to plugins
+ - `DirectPlayback` (3.4+): an input plugin plays on the renderer outside the play queue, as a Connect receiver does; offered as `InputPluginContext.direct_playback`, `None` on older servers
+ - `PlaybackControl` (3.4+): whether the play queue drives the output or an input plugin holds it exclusively; `PlayQueueState.playback_control`, announced by `PlaybackControlChangedEvent`
++- `LiveContent` (3.5+): `ContentInfo.live` exposes an unfinished resource through asynchronous readers, outside the module RPC budget. Its final `size` is `None` until complete; `open(start, end)` pins a reader, and `LiveContentError` explicitly refuses unavailable reads. The server sends unknown-length, non-range HTTP while capture is in progress and finite ranges only after completion. Plugins must bound storage, reader count and idle waits, and wake readers on cancellation.
++- `TrackSource.sequential` (3.5+): a source that cannot be reopened at arbitrary offsets. Direct playback ends its hold on renderer changes/reconnects instead of replaying stale audio. The server polls real renderer progress once per second for pacing. `timeline_offset_ms` shifts the reported media position without seeking the decoder; a plugin starts a fresh independently decodable resource after seeking upstream.
+ 
+ ### Base Classes
+ - `InputModule`: Base class for input modules
+@@ -97,4 +99,4 @@ GPL-3.0-or-later
+ 
+ ## Contributing
+ 
+-Please refer to the main Kalinka Player repository for contribution guidelines.
+\ No newline at end of file
++Please refer to the main Kalinka Player repository for contribution guidelines.
+diff --git a/packages/kalinka-plugin-sdk/src/kalinka_plugin_sdk/_version.py b/packages/kalinka-plugin-sdk/src/kalinka_plugin_sdk/_version.py
+index 873bf60..79d97c8 100644
+--- a/packages/kalinka-plugin-sdk/src/kalinka_plugin_sdk/_version.py
++++ b/packages/kalinka-plugin-sdk/src/kalinka_plugin_sdk/_version.py
+@@ -6,4 +6,4 @@ re-exports it. Bump the major only for a breaking API change, then move the
+ consumers' ``>=N,<N+1`` pins onto the new major. See RELEASING.md.
+ """
+ 
+-__version__ = "3.4.0"
++__version__ = "3.5.0"
+diff --git a/packages/kalinka-plugin-sdk/src/kalinka_plugin_sdk/inputmodule.py b/packages/kalinka-plugin-sdk/src/kalinka_plugin_sdk/inputmodule.py
+index 649178c..40a519b 100644
+--- a/packages/kalinka-plugin-sdk/src/kalinka_plugin_sdk/inputmodule.py
++++ b/packages/kalinka-plugin-sdk/src/kalinka_plugin_sdk/inputmodule.py
+@@ -1,6 +1,6 @@
+ import asyncio
+ 
+-from pydantic import BaseModel, PositiveInt, ConfigDict
++from pydantic import BaseModel, PositiveInt, NonNegativeInt, ConfigDict
+ from enum import Enum
+ from typing import (
+     Awaitable,
+@@ -22,6 +22,7 @@ from .datamodel import (
+     EmptyList,
+ )
+ from .filters import FilterQuery, FilterValueList
++from .live_content import LiveContent
+ 
+ 
+ class SourceUnavailableError(RuntimeError):
+@@ -84,6 +85,10 @@ class TrackSource(BaseModel):
+ 
+     source: ModuleAsset | DirectUrl
+     format: str
++    # Sequential resources cannot be reopened at an arbitrary media offset.
++    # The plugin creates a new resource after a seek or renderer loss.
++    sequential: bool = False
++    timeline_offset_ms: NonNegativeInt = 0
+ 
+ 
+ class ContentInfo(BaseModel):
+@@ -111,11 +116,17 @@ class ContentInfo(BaseModel):
+         cacheable (bool): Whether the server may hold on to these bytes.
+     """
+ 
++    model_config = ConfigDict(arbitrary_types_allowed=True)
++
+     mime_type: str
+     local_path: Optional[str] = None
+     reader: Optional[Callable[[], BinaryIO]] = None
+     size: Optional[int] = None
+     cacheable: bool = False
++    # SDK 3.5: an asynchronous, in-progress resource. Its open method returns
++    # an async reader; waiting for bytes happens outside the module RPC budget.
++    # See live_content.LiveContent for the contract.
++    live: Optional[LiveContent] = None
+ 
+ 
+ class TrackInfo(BaseModel):
+diff --git a/packages/kalinka-plugin-sdk/src/kalinka_plugin_sdk/live_content.py b/packages/kalinka-plugin-sdk/src/kalinka_plugin_sdk/live_content.py
+new file mode 100644
+index 0000000..3556c94
+--- /dev/null
++++ b/packages/kalinka-plugin-sdk/src/kalinka_plugin_sdk/live_content.py
+@@ -0,0 +1,35 @@
++"""Asynchronous content whose final length is not yet known (SDK 3.5)."""
++
++from typing import Optional, Protocol, runtime_checkable
++
++
++class LiveContentError(Exception):
++    """An explicit refusal before HTTP headers are sent."""
++
++    def __init__(self, status: int, message: str):
++        super().__init__(message)
++        self.status = status
++
++
++class LiveReader(Protocol):
++    async def read(self, count: int) -> bytes:
++        """Wait for bytes; b'' means genuine completion, never a temporary gap."""
++        ...
++
++    async def aclose(self) -> None: ...
++
++
++@runtime_checkable
++class LiveContent(Protocol):
++    @property
++    def size(self) -> Optional[int]:
++        """Final, immutable length, or None while being captured."""
++        ...
++
++    async def open(self, start: int, end: Optional[int]) -> LiveReader:
++        """Pin a reader at a byte offset; reject evicted/unavailable bytes.
++
++        end is exclusive. Implementations must bound waits, storage and reader
++        count, wake on cancellation, and retain pinned data until aclose.
++        """
++        ...
+diff --git a/packages/kalinka-renderer/src/native_player/AlsaAudioEmitter.cpp b/packages/kalinka-renderer/src/native_player/AlsaAudioEmitter.cpp
+index 9725ceb..470006c 100644
+--- a/packages/kalinka-renderer/src/native_player/AlsaAudioEmitter.cpp
++++ b/packages/kalinka-renderer/src/native_player/AlsaAudioEmitter.cpp
+@@ -568,7 +568,6 @@ void AlsaAudioEmitter::workerThread(std::stop_token token) {
+         throw std::runtime_error("Unsupported stream type");
+       }
+ 
+-      setState(StreamState(AudioGraphNodeState::PREPARING));
+       setupAudioFormat(streamInfo.value().format);
+       streamInfo.value().format = currentStreamAudioFormat;
+ 
+@@ -588,6 +587,10 @@ void AlsaAudioEmitter::workerThread(std::stop_token token) {
+       // further back than this run began however much the device claims.
+       snd_pcm_uframes_t streamStartPosition = std::max(
+           currentSourceStartFrames, currentSourceTotalFramesWritten - queued);
++      // A refill is still the same timeline. Reporting zero here rewinds a
++      // live producer's progress/credit when it has already played this prefix.
++      setState({AudioGraphNodeState::PREPARING,
++                framesToTimeMs(streamStartPosition).count(), streamInfo});
+       paused = false;
+ 
+       while (!token.stop_requested()) {
+diff --git a/packages/kalinka-renderer/src/native_player/AudioGraphHttpStream.cpp b/packages/kalinka-renderer/src/native_player/AudioGraphHttpStream.cpp
+index 5feb89f..b5c0b7b 100644
+--- a/packages/kalinka-renderer/src/native_player/AudioGraphHttpStream.cpp
++++ b/packages/kalinka-renderer/src/native_player/AudioGraphHttpStream.cpp
+@@ -93,7 +93,7 @@ int AudioGraphHttpStream::transferInfoCallback(void *stream, curl_off_t,
+ }
+ 
+ bool AudioGraphHttpStream::stalled() const {
+-  return stallTimeout > std::chrono::seconds::zero() &&
++  return !live && stallTimeout > std::chrono::seconds::zero() &&
+          std::chrono::steady_clock::now() - silentSince >= stallTimeout;
+ }
+ 
+@@ -123,12 +123,27 @@ size_t AudioGraphHttpStream::headerCallback(char *buffer, size_t size,
+       size_t separator = value.find('/');
+       if (separator != std::string::npos) {
+         value = value.substr(separator + 1);
+-        contentLength = std::stoul(value);
++        if (value != "*") {
++          contentLength = std::stoull(value);
++          lengthKnown = true;
++        }
+       }
+     }
+     if (key == "accept-ranges") {
+       acceptRange = (value == "bytes");
+     }
++    if (key == "x-kalinka-live" && value == "1") {
++      live = true;
++      acceptRange = false;
++    }
++    if (key == "content-length" && !lengthKnown) {
++      long responseCode = 0;
++      curlpp::Info<CURLINFO_RESPONSE_CODE, long>::get(request, responseCode);
++      if (responseCode == 200) {
++        contentLength = std::stoull(value);
++        lengthKnown = true;
++      }
++    }
+   }
+   return totalSize;
+ }
+@@ -140,7 +155,7 @@ void AudioGraphHttpStream::handleSeekSignal(size_t position) {
+   }
+ 
+   buffer.clear();
+-  if (position >= contentLength) {
++  if (lengthKnown && position >= contentLength) {
+     offset = contentLength;
+   } else {
+     buffer.resetEof();
+@@ -185,7 +200,7 @@ void AudioGraphHttpStream::reader(std::stop_token stopToken) {
+ void AudioGraphHttpStream::readContentChunks(std::stop_token stopToken) {
+   using namespace std::placeholders;
+   int numRetries = RETRIES;
+-  while (offset < contentLength) {
++  while (!lengthKnown || offset < contentLength) {
+     auto seekToPos = seekRequestSignal.getValue();
+     if (seekToPos) {
+       handleSeekSignal(seekToPos.value());
+diff --git a/packages/kalinka-renderer/src/native_player/AudioGraphHttpStream.h b/packages/kalinka-renderer/src/native_player/AudioGraphHttpStream.h
+index 52ebfa2..9dc1491 100644
+--- a/packages/kalinka-renderer/src/native_player/AudioGraphHttpStream.h
++++ b/packages/kalinka-renderer/src/native_player/AudioGraphHttpStream.h
+@@ -44,7 +44,9 @@ private:
+   std::jthread readerThread;
+   std::string url;
+   Buffer<uint8_t> buffer;
+-  size_t contentLength = 1;
++  size_t contentLength = 0;
++  bool lengthKnown = false;
++  bool live = false;
+   size_t offset = 0;
+   size_t bytesToSkip = 0;
+   Signal<size_t> seekRequestSignal;
+@@ -70,4 +72,4 @@ private:
+   curlpp::Easy request;
+ };
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/packages/kalinka-renderer/src/native_player/AudioPlayer.cpp b/packages/kalinka-renderer/src/native_player/AudioPlayer.cpp
+index d98b0f9..6e61a3a 100644
+--- a/packages/kalinka-renderer/src/native_player/AudioPlayer.cpp
++++ b/packages/kalinka-renderer/src/native_player/AudioPlayer.cpp
+@@ -43,6 +43,23 @@ float percentToGain(int percent) {
+   return p * p * p;
+ }
+ 
++// Keep rejection in the graph so queued failures only surface when their
++// source becomes current, with the same stream identity as decoder errors.
++class UnsupportedStreamNode : public AudioGraphOutputNode {
++public:
++  explicit UnsupportedStreamNode(StreamId id) : AudioGraphNode(id) {
++    setState({AudioGraphNodeState::ERROR,
++              {StreamErrorSource::DECODER, "Unsupported stream format"}});
++  }
++
++  size_t read(void *, size_t) override { return 0; }
++  size_t waitForData(std::stop_token, size_t) override { return 0; }
++  size_t waitForDataFor(std::stop_token, std::chrono::milliseconds,
++                       size_t) override {
++    return 0;
++  }
++};
++
+ // Pseudo-scheme for the speaker test:
+ //   tone://<left|right|both>?freq=<hz>&duration_ms=<ms>
+ // Generates audio in-process (SineWaveNode) instead of reading a stream, so
+@@ -116,6 +133,13 @@ struct StreamNodes {
+       return;
+     }
+ 
++    if (format != AudioFormat::FormatFlac && format != AudioFormat::FormatMpeg &&
++        format != AudioFormat::FormatVorbis) {
++      // Reject before fetching bytes or opening an input/decoder.
++      nodeChain.emplace_back(std::make_shared<UnsupportedStreamNode>(id));
++      return;
++    }
++
+     if (url.substr(0, 7) == "file://") {
+       // Use FileInputNode for local files
+       std::string filePath = url.substr(7);
+@@ -166,10 +190,7 @@ struct StreamNodes {
+       return decoder;
+     }
+     default:
+-      spdlog::warn(
+-          "Undefined format {}, assuming raw and not attaching any decoder",
+-          static_cast<int>(format));
+-      return outputNode;
++      return std::make_shared<UnsupportedStreamNode>(id);
+     }
+   }
+ 
+diff --git a/packages/kalinka-renderer/src/native_player/AudioPlayer.h b/packages/kalinka-renderer/src/native_player/AudioPlayer.h
+index 3b4c7a4..6b271d7 100644
+--- a/packages/kalinka-renderer/src/native_player/AudioPlayer.h
++++ b/packages/kalinka-renderer/src/native_player/AudioPlayer.h
+@@ -15,7 +15,7 @@ class AudioStreamSwitcher;
+ struct StreamNodes;
+ class StateMonitor;
+ 
+-enum AudioFormat { FormatFlac = 0, FormatMpeg, FormatVorbis };
++enum AudioFormat { FormatFlac = 0, FormatMpeg, FormatVorbis, FormatUnsupported };
+ 
+ using StreamId = size_t;
+ 
+diff --git a/packages/kalinka-renderer/src/native_player/StreamState.h b/packages/kalinka-renderer/src/native_player/StreamState.h
+index c3b4cce..2108d63 100644
+--- a/packages/kalinka-renderer/src/native_player/StreamState.h
++++ b/packages/kalinka-renderer/src/native_player/StreamState.h
+@@ -72,6 +72,15 @@ struct StreamState {
+   explicit StreamState(AudioGraphNodeState state)
+       : state(state), position(0), timestamp(getTimestampNs()) {}
+ 
++  // position is anchored when the state changes. A later snapshot must move
++  // the running clock forward, without advancing a paused or buffering source.
++  long positionAt(unsigned long long now) const {
++    return position +
++           (state == AudioGraphNodeState::STREAMING && now > timestamp
++                ? static_cast<long>((now - timestamp) / 1000000)
++                : 0);
++  }
++
+   StreamState(AudioGraphNodeState state, long position)
+       : state(state), position(position), timestamp(getTimestampNs()) {}
+ 
+diff --git a/packages/kalinka-renderer/src/native_player/VorbisStreamDecoder.cpp b/packages/kalinka-renderer/src/native_player/VorbisStreamDecoder.cpp
+index 454251d..ae677a2 100644
+--- a/packages/kalinka-renderer/src/native_player/VorbisStreamDecoder.cpp
++++ b/packages/kalinka-renderer/src/native_player/VorbisStreamDecoder.cpp
+@@ -131,9 +131,11 @@ size_t VorbisStreamDecoder::readInput(void *data, size_t size, size_t count) {
+   }
+   auto combined = combineStopTokens(workerToken, seekSignal.getStopToken());
+   const auto token = interruptReadForSeek ? combined.get_token() : workerToken;
+-  // Input buffers cap the requested minimum at their capacity and can also
+-  // return a short final read.
+-  const auto available = inputNode->waitForData(token, size * count);
++  // A live producer can wait for playback before sending its next page.
++  // Waiting for libvorbisfile's full read buffer would deadlock even when a
++  // complete page is already available. Return available whole items; only a
++  // zero-length read signals EOF to libvorbisfile.
++  const auto available = inputNode->waitForData(token, size);
+   if (token.stop_requested()) {
+     return 0;
+   }
+diff --git a/packages/kalinka-renderer/src/player/NativePlayer.cpp b/packages/kalinka-renderer/src/player/NativePlayer.cpp
+index e6f08df..f70518c 100644
+--- a/packages/kalinka-renderer/src/player/NativePlayer.cpp
++++ b/packages/kalinka-renderer/src/player/NativePlayer.cpp
+@@ -7,6 +7,7 @@
+ #include <cctype>
+ #include <chrono>
+ #include <span>
++#include <string_view>
+ 
+ #include "../config/ConfigContributor.h"
+ #include "../config/SettingsPersistence.h"
+@@ -31,26 +32,41 @@ AudioFormat formatOf(const pb::Source &source) {
+                    [](unsigned char c) { return std::tolower(c); });
+     return value;
+   };
+-  const auto mime = lower(source.mime_type());
+-  if (mime.find("mpeg") != std::string::npos ||
+-      mime.find("mp3") != std::string::npos) {
++  const auto mimeValue = lower(source.mime_type());
++  std::string_view mime(mimeValue);
++  mime = mime.substr(0, mime.find(';'));
++  const auto first = mime.find_first_not_of(" \t\r\n");
++  mime = first == std::string_view::npos
++             ? std::string_view{}
++             : mime.substr(first, mime.find_last_not_of(" \t\r\n") - first + 1);
++  if (mime == "audio/mpeg" || mime == "audio/mp3" || mime == "audio/x-mp3" ||
++      mime == "mpeg" || mime == "mp3") {
+     return AudioFormat::FormatMpeg;
+   }
+-  if (mime.find("flac") != std::string::npos) {
++  if (mime == "audio/flac" || mime == "audio/x-flac" || mime == "flac") {
+     return AudioFormat::FormatFlac;
+   }
+-  if (mime.find("ogg") != std::string::npos ||
+-      mime.find("vorbis") != std::string::npos) {
++  if (mime == "audio/ogg" || mime == "application/ogg" ||
++      mime == "audio/vorbis" || mime == "audio/x-vorbis+ogg" ||
++      mime == "ogg" || mime == "vorbis") {
+     return AudioFormat::FormatVorbis;
+   }
++  // A declared, unsupported type must not be overridden by the URL suffix.
++  // Extension lookup is only a fallback for missing or generic metadata.
++  if (!mime.empty() && mime != "application/octet-stream") {
++    return AudioFormat::FormatUnsupported;
++  }
+   const auto path = lower(source.uri().substr(0, source.uri().find_first_of("?#")));
++  if (path.ends_with(".flac")) {
++    return AudioFormat::FormatFlac;
++  }
+   if (path.ends_with(".mp3")) {
+     return AudioFormat::FormatMpeg;
+   }
+   if (path.ends_with(".ogg") || path.ends_with(".oga")) {
+     return AudioFormat::FormatVorbis;
+   }
+-  return AudioFormat::FormatFlac;
++  return AudioFormat::FormatUnsupported;
+ }
+ 
+ // The noisy virtual PCMs the server's device list also hides. "sysdefault:" is
+@@ -884,7 +900,10 @@ void NativePlayer::fillSnapshot(pb::StateSnapshot &out) const {
+     return;
+   }
+ 
+-  const StreamState state = player_->getState();
++  StreamState state = player_->getState();
++  const auto now = getTimestampNs();
++  state.position = state.positionAt(now);
++  state.timestamp = now;
+   const std::optional<StreamId> onAir =
+       state.streamId ? state.streamId : currentId_;
+   pb::PlaybackStateChanged translated;
+diff --git a/packages/kalinka-renderer/tests/native_player/AlsaAudioEmitter_test.cpp b/packages/kalinka-renderer/tests/native_player/AlsaAudioEmitter_test.cpp
+index 4a9a4f3..259f658 100644
+--- a/packages/kalinka-renderer/tests/native_player/AlsaAudioEmitter_test.cpp
++++ b/packages/kalinka-renderer/tests/native_player/AlsaAudioEmitter_test.cpp
+@@ -177,9 +177,11 @@ TEST_F(AlsaAudioEmitterTest, slow_output_node_goes_into_preparing) {
+       waitForStatus(*alsaAudioEmitter, AudioGraphNodeState::STREAMING).state,
+       AudioGraphNodeState::STREAMING);
+ 
+-  EXPECT_EQ(
+-      waitForStatus(*alsaAudioEmitter, AudioGraphNodeState::PREPARING).state,
+-      AudioGraphNodeState::PREPARING);
++  const auto buffering =
++      waitForStatus(*alsaAudioEmitter, AudioGraphNodeState::PREPARING);
++  EXPECT_EQ(buffering.state, AudioGraphNodeState::PREPARING);
++  EXPECT_EQ(buffering.position, duration / 2);
++  EXPECT_TRUE(buffering.streamInfo.has_value());
+ 
+   auto state = waitForStatus(*alsaAudioEmitter, AudioGraphNodeState::STREAMING);
+ 
+@@ -308,4 +310,4 @@ TEST_F(AlsaAudioEmitterTest, test_play_after_finished) {
+                           std::chrono::milliseconds(1500))
+                 .state,
+             AudioGraphNodeState::FINISHED);
+-}
+\ No newline at end of file
++}
+diff --git a/packages/kalinka-renderer/tests/native_player/AudioGraphHttpStream_test.cpp b/packages/kalinka-renderer/tests/native_player/AudioGraphHttpStream_test.cpp
+index a38a4d6..5d1bfe9 100644
+--- a/packages/kalinka-renderer/tests/native_player/AudioGraphHttpStream_test.cpp
++++ b/packages/kalinka-renderer/tests/native_player/AudioGraphHttpStream_test.cpp
+@@ -79,8 +79,7 @@ TEST_F(AudioGraphHttpStreamTest, read_no_ranges) {
+   auto state =
+       waitForStatus(*audioGraphHttpStream, AudioGraphNodeState::STREAMING);
+   size_t totalLength = state.streamInfo.value().streamSize;
+-  // Streaming data, no length available
+-  EXPECT_EQ(totalLength, 1);
++  EXPECT_EQ(totalLength, fileContent(file).size());
+   size_t bytesToRead = 0;
+   size_t totalBytesRead = 0;
+   while ((bytesToRead =
+@@ -486,3 +485,30 @@ TEST_F(AudioGraphHttpStreamTest, stalls_between_progress_do_not_use_up_retries)
+   ASSERT_EQ(content.size(), expected.size());
+   EXPECT_TRUE(std::equal(content.begin(), content.end(), expected.begin()));
+ }
++
++TEST_F(AudioGraphHttpStreamTest, LiveChunkedResponseHasUnknownLength) {
++  AudioGraphHttpStream stream(1, server.url("/live"), bufferSize);
++  const auto state = waitForStatus(stream, AudioGraphNodeState::STREAMING);
++  ASSERT_TRUE(state.streamInfo);
++  EXPECT_EQ(state.streamInfo->streamSize, 0);
++  EXPECT_EQ(readToEnd(stream), fileContent(file));
++}
++
++TEST_F(AudioGraphHttpStreamTest, LivePauseDoesNotBecomeStallOrEof) {
++  AudioGraphHttpStream stream(1, server.url("/live-held"), bufferSize, 0,
++                              std::chrono::seconds(1));
++  const auto state = waitForStatus(stream, AudioGraphNodeState::STREAMING);
++  ASSERT_TRUE(state.streamInfo);
++  EXPECT_EQ(state.streamInfo->streamSize, 0);
++  std::vector<uint8_t> first(1000);
++  ASSERT_EQ(stream.waitForData({}, 1000), 1000);
++  ASSERT_EQ(stream.read(first.data(), first.size()), 1000);
++  EXPECT_EQ(stream.waitForDataFor({}, std::chrono::milliseconds(2200), 1), 0);
++  EXPECT_NE(stream.getState().state, AudioGraphNodeState::ERROR);
++  EXPECT_NE(stream.getState().state, AudioGraphNodeState::FINISHED);
++  server.release();
++  const auto rest = readToEnd(stream);
++  first.insert(first.end(), rest.begin(), rest.end());
++  EXPECT_EQ(first, fileContent(file));
++  EXPECT_EQ(server.requestsTo("/live-held"), 1);
++}
+diff --git a/packages/kalinka-renderer/tests/native_player/LocalHttpServer.cpp b/packages/kalinka-renderer/tests/native_player/LocalHttpServer.cpp
+index 8d8d3de..7b736d6 100644
+--- a/packages/kalinka-renderer/tests/native_player/LocalHttpServer.cpp
++++ b/packages/kalinka-renderer/tests/native_player/LocalHttpServer.cpp
+@@ -132,6 +132,18 @@ Reply stalled(Response response, size_t sentFirst) {
+ /// its path.
+ Reply answer(const Request &request, const std::string &body, bool first) {
+   const std::string_view target = request.target();
++  if (target == "/live" || target == "/live-held") {
++    Response response = respond(request, http::status::ok, body);
++    response.erase(http::field::content_length);
++    response.set(http::field::accept_ranges, "none");
++    response.set("X-Kalinka-Live", "1");
++    response.keep_alive(false);
++    if (target == "/live-held") {
++      return {std::move(response), Delivery::Held, 1000};
++    }
++    response.chunked(true);
++    return {std::move(response)};
++  }
+   if (target == "/ranged") {
+     return {ranged(request, body)};
+   }
+@@ -293,6 +305,8 @@ void LocalHttpServer::serve(tcp::socket &socket) {
+       break;
+     }
+     if (error || !response.keep_alive()) {
++      socket.shutdown(tcp::socket::shutdown_both, error);
++      socket.close(error);
+       return;
+     }
+   }
+diff --git a/packages/kalinka-renderer/tests/native_player/VorbisStreamDecoder_test.cpp b/packages/kalinka-renderer/tests/native_player/VorbisStreamDecoder_test.cpp
+index 7e4dbe9..fa5c6f3 100644
+--- a/packages/kalinka-renderer/tests/native_player/VorbisStreamDecoder_test.cpp
++++ b/packages/kalinka-renderer/tests/native_player/VorbisStreamDecoder_test.cpp
+@@ -375,3 +375,53 @@ TEST(VorbisStreamDecoderTest, DisconnectUnblocksInputWaitingForData) {
+       returnsWithin([decoder, source] { decoder->disconnect(source); }, 1s));
+ }
+ } // namespace
++
++TEST(VorbisStreamDecoderTest, PlaysChunkedOggWithUnknownLength) {
++  LocalHttpServer server(fixture());
++  auto source = std::make_shared<AudioGraphHttpStream>(1, server.url("/live"), 16384);
++  VorbisStreamDecoder decoder(1, 16384);
++  decoder.connectTo(source);
++  const auto pcm = decode(decoder);
++  EXPECT_EQ(pcm.size(), kFrames * kFrameBytes);
++  EXPECT_EQ(decoder.getState().state, AudioGraphNodeState::FINISHED);
++  EXPECT_EQ(server.requestsTo("/live"), 1);
++}
++
++TEST(VorbisStreamDecoderTest, StartsBeforeTheNextLivePageOrEndOfStream) {
++  class LiveInput : public AudioGraphOutputNode {
++  public:
++    Buffer<uint8_t> bytes{16384};
++    LiveInput() {
++      setState({AudioGraphNodeState::STREAMING, 0,
++                StreamInfo{.streamType = StreamType::BYTES}});
++    }
++    size_t read(void *out, size_t count) override {
++      return bytes.read(static_cast<uint8_t *>(out), count);
++    }
++    size_t waitForData(std::stop_token token, size_t count) override {
++      return bytes.waitForData(token, count);
++    }
++    size_t waitForDataFor(std::stop_token token, std::chrono::milliseconds timeout,
++                         size_t count) override {
++      return bytes.waitForDataFor(token, timeout, count);
++    }
++  };
++  const auto ogg = encoded();
++  // Three pages: identification, remaining headers, and about one second of
++  // audio. The producer waits for playback feedback before sending any more.
++  size_t prefix = 0;
++  for (int page = 0; page < 3; ++page) {
++    const auto segments = ogg.at(prefix + 26);
++    size_t length = 27 + segments;
++    for (size_t i = 0; i < segments; ++i) {
++      length += ogg.at(prefix + 27 + i);
++    }
++    prefix += length;
++  }
++  auto source = std::make_shared<LiveInput>();
++  ASSERT_EQ(source->bytes.write(ogg.data(), prefix), prefix);
++  VorbisStreamDecoder decoder(1, 16384);
++  decoder.connectTo(source);
++  EXPECT_GE(decoder.waitForDataFor({}, 1s, 1024), 1024);
++  decoder.disconnect(source);
++}
+diff --git a/packages/kalinka-renderer/tests/test_native_player_settings.cpp b/packages/kalinka-renderer/tests/test_native_player_settings.cpp
+index 517f89a..123c8b5 100644
+--- a/packages/kalinka-renderer/tests/test_native_player_settings.cpp
++++ b/packages/kalinka-renderer/tests/test_native_player_settings.cpp
+@@ -119,6 +119,48 @@ TEST_F(NativePlayerSettingsTest, TheSinkIsBufferedAsTheServerUsedToBufferIt) {
+   EXPECT_EQ(period->default_value(), "40");
+ }
+ 
++TEST_F(NativePlayerSettingsTest, RepeatedSnapshotsAdvanceAndPauseFreezesPosition) {
++  SKIP_UNLESS_PLAYED_IN_REAL_TIME();
++  ASSERT_TRUE(player_->applyConfig("output.device", testDevice(), error_)) << error_;
++  ASSERT_TRUE(player_->applyConfig("output.volume_mode", "software", error_)) << error_;
++  player_->setVolume(0);
++  pb::Source source;
++  source.set_source_token("snapshot-clock");
++  source.set_uri("file://" + std::string(KALINKA_TEST_DATA_DIR) + "/ladder.ogg");
++  source.set_mime_type("audio/ogg");
++  player_->setSource(source);
++  auto awaitState = [&](pb::PlaybackState wanted) {
++    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
++    pb::StateSnapshot state;
++    do {
++      ioc_.restart();
++      ioc_.run_for(std::chrono::milliseconds(10));
++      player_->fillSnapshot(state);
++      if (state.playback_state() == wanted) return true;
++    } while (std::chrono::steady_clock::now() < deadline);
++    return false;
++  };
++  ASSERT_TRUE(awaitState(pb::PLAYBACK_STATE_PLAYING));
++  pb::StateSnapshot previous;
++  player_->fillSnapshot(previous);
++  for (int i = 0; i < 3; ++i) {
++    std::this_thread::sleep_for(std::chrono::milliseconds(150));
++    pb::StateSnapshot next;
++    player_->fillSnapshot(next);
++    EXPECT_EQ(next.playback_state(), pb::PLAYBACK_STATE_PLAYING);
++    EXPECT_GE(next.position_ms(), previous.position_ms() + 100);
++    previous = next;
++  }
++  player_->pause();
++  ASSERT_TRUE(awaitState(pb::PLAYBACK_STATE_PAUSED));
++  player_->fillSnapshot(previous);
++  std::this_thread::sleep_for(std::chrono::milliseconds(200));
++  pb::StateSnapshot paused;
++  player_->fillSnapshot(paused);
++  EXPECT_EQ(paused.position_ms(), previous.position_ms());
++  player_->stop();
++}
++
+ TEST_F(NativePlayerSettingsTest, OnlyWhatAUserPicksIsOnThePageProper) {
+   const pb::ConfigSection section = output();
+ 
+@@ -306,11 +348,12 @@ TEST_F(NativePlayerSettingsTest, VorbisBufferCanBeConfiguredAndPersisted) {
+   EXPECT_EQ(loadSettingsOverrides().at("buffers.vorbis"), "200000");
+ }
+ 
+-TEST_F(NativePlayerSettingsTest, VorbisSourcesPlayThroughTheProtocolAdapter) {
++TEST_F(NativePlayerSettingsTest, SupportedSourcesPlayThroughTheProtocolAdapter) {
+   using namespace std::chrono_literals;
+   struct SourceCase {
+     const char *mime;
+     const char *name;
++    const char *fixture = "ladder.ogg";
+   };
+   const SourceCase cases[] = {
+       {"audio/ogg", "track"},
+@@ -318,18 +361,33 @@ TEST_F(NativePlayerSettingsTest, VorbisSourcesPlayThroughTheProtocolAdapter) {
+       {"audio/vorbis", "track"},
+       {"audio/x-vorbis+ogg", "track"},
+       {"Audio/Ogg; codecs=vorbis", "track.flac"},
++      {"ogg", "track"},
++      {"vorbis", "track"},
+       {"", "track.ogg"},
+       {"", "track.oga"},
+       {"application/octet-stream", "track.OGG"},
+       // A literal query in a local filename lets the adapter's URL suffix
+       // handling be exercised without a remote server or signed URL.
+       {"", "track.OGA?token=opaque#fragment"},
++      {"audio/flac", "track", "ladder.flac"},
++      {"audio/x-flac", "track", "ladder.flac"},
++      {"flac", "track", "ladder.flac"},
++      {" Audio/FLAC ; rate=22050", "track.mp3", "ladder.flac"},
++      {"", "track.flac", "ladder.flac"},
++      {"application/octet-stream", "track.FLAC?token=opaque#fragment", "ladder.flac"},
++      {"audio/mpeg", "track", "ladder.mp3"},
++      {"audio/mp3", "track", "ladder.mp3"},
++      {"audio/x-mp3", "track", "ladder.mp3"},
++      {"mpeg", "track", "ladder.mp3"},
++      {"mp3", "track", "ladder.mp3"},
++      {"", "track.mp3", "ladder.mp3"},
++      {"application/octet-stream", "track.MP3?token=opaque#fragment", "ladder.mp3"},
+   };
+   auto work = boost::asio::make_work_guard(ioc_);
+   for (const auto &test : cases) {
+     SCOPED_TRACE(std::string(test.mime) + " " + test.name);
+     const auto path = prefix_ / test.name;
+-    fs::copy_file(fs::path(KALINKA_TEST_DATA_DIR) / "ladder.ogg", path,
++    fs::copy_file(fs::path(KALINKA_TEST_DATA_DIR) / test.fixture, path,
+                   fs::copy_options::overwrite_existing);
+     std::vector<pb::PlaybackStateChanged> states;
+     player_->setStateSink([&](pb::Envelope &env) {
+@@ -371,6 +429,111 @@ TEST_F(NativePlayerSettingsTest, VorbisSourcesPlayThroughTheProtocolAdapter) {
+   }
+ }
+ 
++TEST_F(NativePlayerStreamTest, SpeakerTestToneNeedsNoStreamFormat) {
++  std::vector<pb::PlaybackState> states;
++  player_->setStateSink([&](pb::Envelope &env) {
++    if (env.has_playback_state_changed()) {
++      states.push_back(env.playback_state_changed().state());
++    }
++  });
++  pb::Source source;
++  source.set_source_token("speaker-test");
++  source.set_uri("tone://both?duration_ms=1000");
++  player_->setSource(source);
++  EXPECT_TRUE(runUntil([&] {
++    return std::ranges::count(states, pb::PLAYBACK_STATE_FINISHED) > 0 ||
++           std::ranges::count(states, pb::PLAYBACK_STATE_ERROR) > 0;
++  }));
++  EXPECT_GT(std::ranges::count(states, pb::PLAYBACK_STATE_PLAYING), 0);
++  EXPECT_GT(std::ranges::count(states, pb::PLAYBACK_STATE_FINISHED), 0);
++  EXPECT_EQ(std::ranges::count(states, pb::PLAYBACK_STATE_ERROR), 0);
++  player_->setStateSink({});
++}
++
++TEST_F(NativePlayerStreamTest, UnsupportedSourcesFailBeforeOpeningTheStream) {
++  struct SourceCase {
++    const char *mime;
++    const char *path;
++  };
++  const SourceCase cases[] = {
++      {"audio/aac", "/whole"},
++      {"audio/aac", "/track.flac"},
++      {"audio/mpeg4", "/whole"},
++      {"audio/not-flac", "/whole"},
++      {"", "/whole"},
++      {"application/octet-stream", "/whole?name=track.flac"},
++  };
++  for (const auto &test : cases) {
++    SCOPED_TRACE(std::string(test.mime) + " " + test.path);
++    std::vector<pb::PlaybackStateChanged> states;
++    player_->setStateSink([&](pb::Envelope &env) {
++      if (env.has_playback_state_changed()) {
++        states.push_back(env.playback_state_changed());
++      }
++    });
++    auto source = sourceAt(test.path);
++    source.set_mime_type(test.mime);
++    player_->setSource(source);
++    EXPECT_TRUE(runUntil([&] {
++      return std::any_of(states.begin(), states.end(), [](const auto &state) {
++        return state.state() == pb::PLAYBACK_STATE_ERROR ||
++               state.state() == pb::PLAYBACK_STATE_FINISHED;
++      });
++    }));
++    pb::StateSnapshot snapshot;
++    player_->fillSnapshot(snapshot);
++    EXPECT_EQ(snapshot.playback_state(), pb::PLAYBACK_STATE_ERROR);
++    EXPECT_EQ(snapshot.error().source(), pb::ERROR_SOURCE_DECODER);
++    EXPECT_EQ(snapshot.error().message(), "Unsupported stream format");
++    EXPECT_EQ(snapshot.current_source().source_token(), source.source_token());
++    EXPECT_FALSE(snapshot.position_valid());
++    EXPECT_TRUE(std::any_of(states.begin(), states.end(), [&](const auto &state) {
++      return state.state() == pb::PLAYBACK_STATE_ERROR &&
++             state.source_token() == source.source_token() &&
++             state.error().message() == "Unsupported stream format";
++    }));
++    EXPECT_EQ(server_.requestsTo(test.path), 0);
++    player_->setStateSink({});
++    player_->stop();
++    ioc_.poll();
++  }
++}
++
++TEST_F(NativePlayerStreamTest, QueuedUnsupportedSourceReportsItsOwnErrorAndRecovers) {
++  std::vector<pb::PlaybackStateChanged> states;
++  player_->setStateSink([&](pb::Envelope &env) {
++    if (env.has_playback_state_changed()) {
++      states.push_back(env.playback_state_changed());
++    }
++  });
++  const auto reached = [&](const std::string &token, pb::PlaybackState wanted) {
++    return std::any_of(states.begin(), states.end(), [&](const auto &state) {
++      return state.source_token() == token && state.state() == wanted;
++    });
++  };
++  player_->setSource(sourceAt("/held"));
++  EXPECT_TRUE(runUntil([&] { return reached("/held", pb::PLAYBACK_STATE_PLAYING); }));
++  auto unsupported = sourceAt("/whole");
++  unsupported.set_mime_type("audio/aac");
++  player_->enqueueSource(unsupported);
++  ioc_.run_for(std::chrono::milliseconds(100));
++  EXPECT_FALSE(reached("/whole", pb::PLAYBACK_STATE_ERROR));
++  EXPECT_EQ(server_.requestsTo("/whole"), 0);
++
++  server_.release();
++  EXPECT_TRUE(runUntil([&] { return reached("/whole", pb::PLAYBACK_STATE_ERROR); }));
++  pb::StateSnapshot snapshot;
++  player_->fillSnapshot(snapshot);
++  EXPECT_EQ(snapshot.current_source().source_token(), "/whole");
++  EXPECT_EQ(snapshot.error().message(), "Unsupported stream format");
++
++  player_->setSource(sourceAt("/ranged"));
++  EXPECT_TRUE(runUntil([&] { return reached("/ranged", pb::PLAYBACK_STATE_FINISHED); }));
++  EXPECT_TRUE(reached("/ranged", pb::PLAYBACK_STATE_PLAYING));
++  EXPECT_FALSE(reached("/ranged", pb::PLAYBACK_STATE_ERROR));
++  player_->setStateSink({});
++}
++
+ TEST_F(NativePlayerSettingsTest, ANegativeSizeIsRefusedRatherThanStored) {
+   EXPECT_FALSE(player_->applyConfig("buffers.flac", "-1", error_));
+   EXPECT_EQ(error_, "must not be negative");
+diff --git a/packages/kalinka-renderer/tests/test_state_translator.cpp b/packages/kalinka-renderer/tests/test_state_translator.cpp
+index 60b2362..c255a75 100644
+--- a/packages/kalinka-renderer/tests/test_state_translator.cpp
++++ b/packages/kalinka-renderer/tests/test_state_translator.cpp
+@@ -11,6 +11,21 @@ using state_translator::fillPlaybackStateChanged;
+ using state_translator::fillVolume;
+ using state_translator::toProto;
+ 
++TEST(StreamClock, PollingBetweenStateChangesAdvancesOnlyWhilePlaying) {
++  StreamState state(AudioGraphNodeState::STREAMING, 68000);
++  state.timestamp = 1000000000;
++  EXPECT_EQ(state.positionAt(2000000000), 69000);
++  EXPECT_EQ(state.positionAt(3000000000), 70000);
++  EXPECT_EQ(state.positionAt(500000000), 68000);
++  EXPECT_EQ(state.position, 68000);
++  for (auto mode : {AudioGraphNodeState::PAUSED, AudioGraphNodeState::PREPARING,
++                    AudioGraphNodeState::STOPPED, AudioGraphNodeState::FINISHED,
++                    AudioGraphNodeState::ERROR}) {
++    state.state = mode;
++    EXPECT_EQ(state.positionAt(3000000000), 68000);
++  }
++}
++
+ TEST(StateTranslator, EveryGraphStateHasExactlyOneProtoState) {
+   EXPECT_EQ(toProto(AudioGraphNodeState::STOPPED), pb::PLAYBACK_STATE_STOPPED);
+   EXPECT_EQ(toProto(AudioGraphNodeState::PREPARING),
+diff --git a/packages/kalinka-server/DEBIAN/control.in b/packages/kalinka-server/DEBIAN/control.in
+index 36fe60f..682c7bb 100644
+--- a/packages/kalinka-server/DEBIAN/control.in
++++ b/packages/kalinka-server/DEBIAN/control.in
+@@ -12,7 +12,7 @@ Depends: adduser,
+     python3-venv,
+     python3-pip,
+     python3-setuptools,
+-    kalinka-plugin-sdk (>= 3.4), kalinka-plugin-sdk (<< 4)
++    kalinka-plugin-sdk (>= 3.5), kalinka-plugin-sdk (<< 4)
+ Recommends: kalinka-web
+ Description: Kalinka Music Player (server)
+   Kalinka Music Player service used in a pair with Kalinka App.
+diff --git a/packages/kalinka-server/pyproject.toml b/packages/kalinka-server/pyproject.toml
+index e3caf1e..4d34d57 100644
+--- a/packages/kalinka-server/pyproject.toml
++++ b/packages/kalinka-server/pyproject.toml
+@@ -51,9 +51,8 @@ dependencies = [
+     # Renderer protocol (renderer_ws_handler.py). The committed generated
+     # bindings (renderer_proto/) pin the runtime floor; `make proto` regenerates.
+     "protobuf>=7.35,<8",
+-    # >=3.3: ConfigIssue and ConfigOption, the vocabulary a plugin answers
+-    # the settings page's suggestion and validation calls in.
+-    "kalinka-plugin-sdk>=3.4,<4",
++    # >=3.5: asynchronous live content and sequential direct playback.
++    "kalinka-plugin-sdk>=3.5,<4",
+ ]
+ dynamic = ["version"]
+ 
+diff --git a/packages/kalinka-server/src/kalinka_server/content_route.py b/packages/kalinka-server/src/kalinka_server/content_route.py
+index cc59071..65cba98 100644
+--- a/packages/kalinka-server/src/kalinka_server/content_route.py
++++ b/packages/kalinka-server/src/kalinka_server/content_route.py
+@@ -25,7 +25,7 @@ from kalinka_plugin_sdk.inputmodule import (
+     SourceUnavailableError,
+ )
+ 
+-from . import ranged_content
++from . import ranged_content, live_content
+ from .content_urls import CONTENT_ROUTE
+ 
+ logger = logging.getLogger(__name__)
+@@ -84,6 +84,8 @@ def register_content_route(
+             )
+         if info is None:
+             raise HTTPException(status_code=404, detail="Content not found")
++        if info.live is not None:
++            return await live_content.serve(info.live, info.mime_type, request)
+         if not info.local_path:
+             return await _serve_stream(info, module_name, asset_id, request)
+ 
+diff --git a/packages/kalinka-server/src/kalinka_server/direct_playback.py b/packages/kalinka-server/src/kalinka_server/direct_playback.py
+index 5e8e8b7..599bfb7 100644
+--- a/packages/kalinka-server/src/kalinka_server/direct_playback.py
++++ b/packages/kalinka-server/src/kalinka_server/direct_playback.py
+@@ -147,6 +147,7 @@ class HolderSession:
+         self._teardown: Optional[asyncio.Future] = None
+         self._consumer = asyncio.get_running_loop().create_task(self._consume())
+         self._volume_watch = asyncio.get_running_loop().create_task(self._watch_volume())
++        self._progress_watch = asyncio.get_running_loop().create_task(self._watch_progress())
+ 
+     # ------------------------------------------------------------------
+     # DirectPlaybackSession
+@@ -228,6 +229,10 @@ class HolderSession:
+         target is claimed before the current renderer is given up. A paused
+         track stays paused.
+         """
++        if self._source is not None and self._source.sequential and renderer_id != self.renderer_id:
++            await self._on_session_lost(CloseReason.RENDERER_LOST)
++            commit()
++            return
+         async with self._swap:
+             old = self._player
+             if self._ended or old.renderer_id in (None, renderer_id):
+@@ -273,6 +278,7 @@ class HolderSession:
+         )
+         player.on_interrupted(self._replay)
+         player.on_session_lost(self._on_session_lost)
++        player.publish_snapshots = True
+         return player
+ 
+     def _start(self, source: TrackSource, track: Optional[Track], offset_ms: int) -> None:
+@@ -302,6 +308,9 @@ class HolderSession:
+         """The renderer came back mid-track: the same stream from where it was."""
+         if self._ended or self._source is None or self._track is None:
+             return
++        if self._source.sequential:
++            await self._on_session_lost(CloseReason.RENDERER_LOST)
++            return
+         await self.play(self._source, self._track, start_offset_ms=position_ms)
+ 
+     async def _on_session_lost(self, reason: Optional[CloseReason]) -> None:
+@@ -317,6 +326,7 @@ class HolderSession:
+             return False
+         self._ended = True
+         self._volume_watch.cancel()
++        self._progress_watch.cancel()
+         self._teardown = asyncio.ensure_future(self._stop_player())
+         await asyncio.shield(self._teardown)
+         if reason is not None:
+@@ -335,6 +345,8 @@ class HolderSession:
+         async for state in self._monitor:
+             if self._ended:
+                 continue
++            if state.stream_id is not None and state.stream_id != self._stream_id:
++                continue
+             if state.state is AudioGraphNodeState.SOURCE_CHANGED:
+                 continue
+             if state.state is AudioGraphNodeState.FINISHED:
+@@ -343,6 +355,16 @@ class HolderSession:
+                 continue
+             self._publish(state)
+ 
++    async def _watch_progress(self) -> None:
++        while not self._ended:
++            await asyncio.sleep(1)
++            if self._source is not None and self._source.sequential:
++                try:
++                    await self._player.request_snapshot()
++                except Exception:
++                    # Session loss/reconnect is handled by the player's callbacks.
++                    logger.debug("Sequential playback snapshot was unavailable")
++
+     async def _watch_volume(self) -> None:
+         """Tell the plugin the output's volume: now, and at every change.
+ 
+@@ -361,7 +383,9 @@ class HolderSession:
+             state=to_state_name(state.state),
+             current_track=self._track,
+             index=None,
+-            position=state.position_at(time.monotonic_ns()),
++            position=state.position_at(time.monotonic_ns()) + (
++                self._source.timeline_offset_ms if self._source else 0
++            ),
+             message=state.error.message if state.error else None,
+             audio_info=to_audio_info(state.stream_info),
+             mime_type=self._source.format if self._source else None,
+diff --git a/packages/kalinka-server/src/kalinka_server/live_content.py b/packages/kalinka-server/src/kalinka_server/live_content.py
+new file mode 100644
+index 0000000..6b28ae8
+--- /dev/null
++++ b/packages/kalinka-server/src/kalinka_server/live_content.py
+@@ -0,0 +1,65 @@
++"""HTTP for explicit in-progress resources, without a fabricated length."""
++
++import asyncio
++import re
++
++from fastapi import Request
++from starlette.responses import Response, StreamingResponse
++from kalinka_plugin_sdk.live_content import LiveContent, LiveContentError
++from . import ranged_content
++
++
++class LiveResponse(StreamingResponse):
++    def __init__(self, reader, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.reader = reader
++
++    async def __call__(self, scope, receive, send):
++        try:
++            await super().__call__(scope, receive, send)
++        finally:
++            # Close even if ASGI cancellation occurs while suspended at yield.
++            await asyncio.shield(self.reader.aclose())
++
++
++async def serve(content: LiveContent, mime_type: str, request: Request) -> Response:
++    size = content.size
++    headers = {"Cache-Control": "no-store", "Accept-Ranges": "none"}
++    start, end, status = 0, size, 200
++    if size is None:
++        headers["X-Kalinka-Live"] = "1"
++        # The renderer probes with a bounded first chunk (e.g. bytes=0-383999).
++        # Ignore either form of initial range and send the whole live response.
++        # A nonzero reconnect must not silently replay the beginning.
++        requested_range = request.headers.get("range")
++        if requested_range is not None and not re.fullmatch(r"bytes=0-[0-9]*", requested_range):
++            return Response(status_code=409, headers=headers)
++    else:
++        headers.update({"Accept-Ranges": "bytes", "Content-Length": str(size)})
++        try:
++            span = ranged_content.resolve_range(request.headers.get("range"), size)
++        except ranged_content.UnsatisfiableRange:
++            response = ranged_content.unsatisfiable_response(size)
++            response.headers["Cache-Control"] = "no-store"
++            return response
++        if span is not None:
++            start, last = span
++            end, status = last + 1, 206
++            headers["Content-Range"] = f"bytes {start}-{last}/{size}"
++            headers["Content-Length"] = str(end - start)
++    if request.method == "HEAD":
++        response = Response(status_code=status, headers=headers, media_type=mime_type)
++        if size is None:
++            del response.headers["content-length"]
++        return response
++    try:
++        reader = await content.open(start, end)
++    except LiveContentError as exc:
++        return Response(status_code=exc.status, headers={"Cache-Control": "no-store"})
++
++    async def chunks():
++        while data := await reader.read(64 * 1024):
++            yield data
++
++    return LiveResponse(reader, chunks(), status_code=status, media_type=mime_type,
++                        headers=headers)
+diff --git a/packages/kalinka-server/src/kalinka_server/renderer_player.py b/packages/kalinka-server/src/kalinka_server/renderer_player.py
+index 1afd613..3f042a1 100644
+--- a/packages/kalinka-server/src/kalinka_server/renderer_player.py
++++ b/packages/kalinka-server/src/kalinka_server/renderer_player.py
+@@ -110,6 +110,8 @@ class RendererPlayer:
+         # Bumped on every published state; an armed release fires only if the
+         # player is still in the state that armed it.
+         self._epoch = 0
++        # Direct sequential playback uses real renderer feedback for pacing.
++        self.publish_snapshots = False
+ 
+     # ------------------------------------------------------------------
+     # The AudioPlayer surface
+@@ -117,6 +119,10 @@ class RendererPlayer:
+     def get_state(self) -> StreamState:
+         return self._last_state
+ 
++    async def request_snapshot(self) -> None:
++        if self._session is not None:
++            await self._session.request_snapshot()
++
+     def stream_uri(self, stream_id: Optional[int]) -> Optional[str]:
+         """Where the renderer is fetching this stream from, while it holds it."""
+         if stream_id is None:
+@@ -384,6 +390,8 @@ class RendererPlayer:
+             # dropped for want of anywhere to send them.
+             if translated.state is self._last_state.state:
+                 self._record(translated)
++                if self.publish_snapshots:
++                    self._monitor.push(translated)
+             else:
+                 self._publish(translated)
+             return
+diff --git a/packages/kalinka-server/tests/test_direct_playback.py b/packages/kalinka-server/tests/test_direct_playback.py
+index f296b68..8c1a0b5 100644
+--- a/packages/kalinka-server/tests/test_direct_playback.py
++++ b/packages/kalinka-server/tests/test_direct_playback.py
+@@ -799,3 +799,60 @@ async def test_the_queue_plays_where_the_plugin_was_moved(
+     await asyncio.sleep(SETTLE_S)
+ 
+     assert _enqueued(other)[-1] == "http://example/1.flac"
++
++
++async def test_sequential_source_reports_timeline_offset(queue, renderer, direct):
++    listener = Listener()
++    hold = await direct.acquire('Spotify Connect', listener)
++    source, track = _connect_track()
++    source = source.model_copy(update={'sequential': True, 'timeline_offset_ms': 45000})
++    await hold.play(source, track)
++    await asyncio.sleep(SETTLE_S)
++    renderer.report_position(1000)
++    await asyncio.sleep(.05)
++    assert listener.states[-1].position >= 46000
++    enqueue = [c for c in renderer.commands if c.WhichOneof('op') == 'enqueue_source'][-1]
++    assert enqueue.enqueue_source.source.start_offset_ms == 0
++
++
++async def test_sequential_source_is_revoked_on_replay(queue, renderer, direct):
++    listener = Listener()
++    hold = await direct.acquire('Spotify Connect', listener)
++    source, track = _connect_track()
++    source = source.model_copy(update={'sequential': True})
++    await hold.play(source, track)
++    await asyncio.sleep(SETTLE_S)
++    before = len(_enqueued(renderer))
++    await hold._replay(1000)
++    await asyncio.sleep(.05)
++    assert not hold.active
++    assert listener.revoked == [RevokeReason.OUTPUT_LOST]
++    assert len(_enqueued(renderer)) == before
++
++
++async def test_sequential_source_target_change_revokes(queue, renderer, direct):
++    listener = Listener()
++    hold = await direct.acquire('Spotify Connect', listener)
++    source, track = _connect_track()
++    source = source.model_copy(update={'sequential': True})
++    await hold.play(source, track)
++    await asyncio.sleep(SETTLE_S)
++    commit = Mock()
++    await hold.move_to('different-renderer', commit)
++    await asyncio.sleep(.05)
++    assert not hold.active
++    assert listener.revoked == [RevokeReason.OUTPUT_LOST]
++    commit.assert_called_once()
++
++
++async def test_sequential_feedback_polls_actual_renderer_position(queue, renderer, direct):
++    listener = Listener()
++    hold = await direct.acquire('Spotify Connect', listener)
++    source, track = _connect_track()
++    source = source.model_copy(update={'sequential': True})
++    await hold.play(source, track)
++    await asyncio.sleep(SETTLE_S)
++    renderer.position_ms = 10000  # No state transition/event is emitted.
++    await asyncio.sleep(1.1)
++    assert listener.states[-1].position >= 10000
++    assert any(c.WhichOneof('op') == 'request_snapshot' for c in renderer.commands)
+diff --git a/packages/kalinka-server/tests/test_live_content.py b/packages/kalinka-server/tests/test_live_content.py
+new file mode 100644
+index 0000000..6d33d7e
+--- /dev/null
++++ b/packages/kalinka-server/tests/test_live_content.py
+@@ -0,0 +1,47 @@
++import asyncio
++import pytest
++from fastapi import FastAPI
++from httpx import ASGITransport, AsyncClient
++from kalinka_plugin_sdk.inputmodule import ContentInfo
++from kalinka_server.content_route import register_content_route
++
++
++class Capture:
++    size = None
++
++    def __init__(self):
++        self.reads = 0
++        self.closed = False
++        self.resolves = 0
++
++    async def get_content_info(self, asset_id):
++        self.resolves += 1
++        return ContentInfo(mime_type='audio/ogg', live=self)
++
++    async def open(self, start, end):
++        assert start == 0 and end is None
++        return self
++
++    async def read(self, count):
++        self.reads += 1
++        await asyncio.sleep(.01)
++        return b'OggS' if self.reads <= 2 else b''
++
++    async def aclose(self):
++        self.closed = True
++
++
++@pytest.mark.parametrize("initial_range", [None, "bytes=0-", "bytes=0-383999", "bytes=0-0"])
++async def test_content_route_hands_off_live_object_outside_module_call(initial_range):
++    capture = Capture()
++    app = FastAPI()
++    register_content_route(app, lambda name: capture)
++    async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:
++        headers = {'Range': initial_range} if initial_range is not None else {}
++        response = await client.get('/content/spotify/generation', headers=headers)
++    assert response.status_code == 200
++    assert response.content == b'OggSOggS'
++    assert 'content-length' not in response.headers
++    assert 'content-range' not in response.headers
++    assert response.headers['accept-ranges'] == 'none'
++    assert capture.resolves == 1 and capture.closed
