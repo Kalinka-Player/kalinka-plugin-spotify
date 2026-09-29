@@ -64,6 +64,8 @@ class Service:
         self.metadata = {}
         self.hold = None
         self.task = self.pacer = None
+        self.exit_watcher = None
+        self.restartable = False
         self.cleanup_task = None
         self.commands = set()
         self.pending = None
@@ -99,6 +101,8 @@ class Service:
         stage = "starting librespot"
         try:
             await self.producer.start()
+            self.restartable = True
+            self.exit_watcher = asyncio.create_task(self._watch_producer())
             self.pacer = asyncio.create_task(self._pace())
             async for event in self.producer.events():
                 if self.closed:
@@ -112,7 +116,7 @@ class Service:
             self.error = (
                 str(exc)
                 if isinstance(exc, (ProducerError, InvalidOgg, CaptureError))
-                else "Spotify playback failed; disable/re-enable to reconnect."
+                else "Spotify playback failed."
             )
             self.status = self.error
             logger.error("Spotify Connect: %s", self.error)
@@ -129,6 +133,15 @@ class Service:
             )
         finally:
             await self._cleanup()
+
+    async def _watch_producer(self):
+        returncode = await self.producer.wait()
+        if self.closed:
+            return
+        self.error = self.status = f"librespot exited (status {returncode})."
+        logger.error("Spotify Connect: %s", self.error)
+        if self.task:
+            self.task.cancel()
 
     async def _invalidate(self):
         self.generation += 1
@@ -190,11 +203,14 @@ class Service:
                 return
         self.bridge_epoch = event.get("epoch", self.bridge_epoch)
         if kind == "error":
+            if event.get("code") == "authentication_failed":
+                self.restartable = False
             raise ProducerError(
                 ERRORS.get(event.get("code"), "Spotify process reported an error.")
             )
         if kind == "ready":
             if event.get("protocol") != 1:
+                self.restartable = False
                 raise ProducerError("Unsupported librespot control protocol")
         elif kind == "connected":
             self.status = "Connected; Spotify manages the queue"
@@ -462,6 +478,8 @@ class Service:
     def on_revoked(self, reason):
         if self.closed:
             return
+        if reason == RevokeReason.SHUTDOWN:
+            self.restartable = False
         if reason is not None and reason != RevokeReason.SHUTDOWN and not self.error:
             if self.awaiting_play:
                 return
@@ -509,9 +527,7 @@ class Service:
                     "suspend", id=handoff_id, position_ms=position_ms
                 )
         except Exception:
-            self.error = (
-                "Spotify could not release playback; disable/re-enable to reconnect."
-            )
+            self.error = "Spotify could not release playback."
             logger.error(self.error)
             self.on_revoked(None)
 
@@ -583,6 +599,9 @@ class Service:
 
     async def _close_resources(self):
         self.closed = True
+        if self.exit_watcher:
+            self.exit_watcher.cancel()
+            await asyncio.gather(self.exit_watcher, return_exceptions=True)
         if self.release_task:
             self.release_task.cancel()
             await asyncio.gather(self.release_task, return_exceptions=True)

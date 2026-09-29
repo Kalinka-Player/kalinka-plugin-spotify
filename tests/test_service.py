@@ -24,6 +24,7 @@ class Producer:
         self.starts = 0
         self.incoming = asyncio.Queue()
         self.audio_reads = []
+        self.exited = asyncio.Future()
 
     async def start(self):
         self.starts += 1
@@ -42,6 +43,9 @@ class Producer:
 
     async def stop(self):
         self.stopped = True
+
+    async def wait(self):
+        return await self.exited
 
 
 class Hold:

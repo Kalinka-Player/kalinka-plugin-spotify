@@ -4,6 +4,26 @@ Checks run locally on 2026-09-28 and 2026-09-29. Offline checks used no Spotify 
 User-assisted local connection checks are recorded below; remote-speaker
 playback remains unverified.
 
+Receiver supervision in version 0.1.2 adds 18 regressions: actual subprocess
+SIGKILL and exit-status recovery, exit detection with a full stdout pipe,
+interruption of a blocked event handler, cleanup of old output/HTTP readers,
+fresh playback after restart, pacing-failure recovery, capped exponential
+backoff and its reset after stable operation, disable during retry, immediate
+disable, and permanent-error/shutdown handling. Idle, paused, buffering and
+queue-handoff sessions keep their receiver. All 128 plugin tests and Ruff
+lint/format checks pass locally. No native librespot or renderer changes are
+needed for this update.
+
+Version 0.1.2 was built as a Debian package and installed on raspberrypi.local.
+After the package's normal server restart, killing only the owned librespot
+child with SIGKILL produced a replacement in 1.07 seconds. The old child was
+reaped; server PID 205801 and renderer PID 186215 remained unchanged. Module
+health changed from warning during retry to ready, the selected renderer was
+preserved, and mDNS advertised Kalinka on the replacement's new port. Its
+discovery endpoint returned `OK`. Installed Python sources match the tested
+files. Resuming music after this induced failure still needs an app playback
+check; discovery recovery does not promise uninterrupted playback.
+
 On 2026-09-29 at 02:51:44 BST, repeated seeks on the Pi exhausted the two-capture
 limit while previous HTTP readers were still closing. The plugin raised
 `Previous renderer readers still hold the playback cache` and stopped its native
@@ -55,7 +75,7 @@ has not yet been confirmed. The Spotify receiver remains on the development host
 
 | Check | Result |
 | --- | --- |
-| Plugin pytest suite | 110 passed after the rapid-seek reader fix |
+| Plugin pytest suite | 128 passed after receiver supervision |
 | Plugin Ruff lint/format | Passed |
 | Plugin wheel and source archive | Built successfully |
 | Debian plugin package | `kalinka-plugin-spotify_0.1.0_all.deb` built and inspected successfully |

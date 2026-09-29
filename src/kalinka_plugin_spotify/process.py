@@ -123,9 +123,19 @@ class Librespot:
             except ValueError:
                 raise ProducerError("Invalid librespot control event") from None
             yield event
-        raise ProducerError(
-            "librespot exited; check account authentication and network, then disable/re-enable Spotify"
-        )
+        raise ProducerError("librespot control connection closed.")
+
+    async def wait(self):
+        process = self.process
+        while process.returncode is None:
+            try:
+                return await asyncio.wait_for(process.wait(), 1)
+            except TimeoutError:
+                # asyncio's pipe transports can postpone wait() completion
+                # after child exit until a full stdout buffer is drained.
+                # The returncode is still updated by its process watcher.
+                pass
+        return process.returncode
 
     async def audio(self, length):
         if not isinstance(length, int) or not 0 < length <= 1024 * 1024:
@@ -164,6 +174,12 @@ class Librespot:
                 except ProcessLookupError:
                     pass
                 await process.wait()
+        if process is not None:
+            # Once event/audio handling has stopped, finish draining our own
+            # stdout transport too. A killed child can leave it paused at the
+            # StreamReader limit; retaining it would leak a pipe on each retry.
+            while await process.stdout.read(64 * 1024):
+                pass
         if self.writer is not None:
             self.writer.close()
             try:

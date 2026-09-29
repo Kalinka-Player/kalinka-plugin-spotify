@@ -56,7 +56,7 @@ async def test_startup_failure_reaches_health_and_logs(
         else:
             assert "OSError" in caplog.text
             assert "in run" in caplog.text
-        assert not Path(plugin.service.directory.name).exists()
+        assert not Path(plugin.service.session.directory.name).exists()
     finally:
         await plugin.shutdown()
 
