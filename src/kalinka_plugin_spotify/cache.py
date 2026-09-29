@@ -28,7 +28,7 @@ class Capture:
         self,
         directory: Path,
         *,
-        max_bytes=32 * 1024 * 1024,
+        max_bytes=64 * 1024 * 1024,
         timeout=1800,
         metadata=None,
         offset_ms=0,
@@ -67,13 +67,16 @@ class Capture:
                 self.failure = "Spotify playback cache limit exceeded"
                 self.condition.notify_all()
                 raise CaptureError(self.failure)
-            written = await disk_call(
-                os.pwrite, self.file.fileno(), data, self.available
-            )
+            try:
+                written = await disk_call(
+                    os.pwrite, self.file.fileno(), data, self.available
+                )
+            except OSError:
+                written = None
             if written != len(data):
                 self.failure = "Spotify playback cache write failed"
                 self.condition.notify_all()
-                raise OSError(self.failure)
+                raise CaptureError(self.failure)
             self.available += written
             self.condition.notify_all()
 

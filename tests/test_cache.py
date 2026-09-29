@@ -1,9 +1,10 @@
 import asyncio
+import os
 
 import pytest
 from kalinka_plugin_sdk.live_content import LiveContentError
 
-from kalinka_plugin_spotify.cache import Capture
+from kalinka_plugin_spotify.cache import Capture, CaptureError
 
 
 async def test_delayed_production_and_pause_are_not_eof(tmp_path):
@@ -81,6 +82,23 @@ async def test_cache_bound(tmp_path):
     assert c.available == 4
     await c.retire()
     assert c.file.closed
+
+
+async def test_disk_write_failure_is_a_capture_error(tmp_path, monkeypatch):
+    c = Capture(tmp_path)
+    r = await c.open(0, None)
+
+    def full(*args):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "pwrite", full)
+    with pytest.raises(CaptureError, match="write failed"):
+        await c.append(b"abc")
+    assert c.available == 0
+    with pytest.raises(OSError, match="write failed"):
+        await r.read(1)
+    await r.aclose()
+    await c.retire()
 
 
 async def test_bounded_wait_and_reader_cancellation(tmp_path):

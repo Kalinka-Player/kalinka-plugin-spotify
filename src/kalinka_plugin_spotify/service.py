@@ -44,7 +44,7 @@ class Service:
         cache_directory: Path,
         *,
         budget_ms=2000,
-        max_bytes=32 * 1024 * 1024,
+        max_bytes=64 * 1024 * 1024,
         reader_timeout=30,
         reader_close_timeout=5,
     ):
@@ -91,6 +91,9 @@ class Service:
         self.awaiting_play = False
         self.suspending = None
         self.handoff_id = 0
+        self.retry_handoff = None
+        self.retried = False
+        self.retried_uri = None
         self.release_task = None
         self.event_lock = asyncio.Lock()
 
@@ -170,6 +173,12 @@ class Service:
                 self._pause_for_output_error(
                     "Output unavailable; press Play in Spotify to retry"
                 )
+            except (InvalidOgg, CaptureError) as exc:
+                # Announced bytes were read in full, so librespot's stdout and
+                # control lanes remain in sync; only this stream is unusable.
+                # Suspend it instead of restarting and dropping Connect.
+                logger.error("Spotify audio stream failed: %s", exc)
+                self._suspend_and_retry(f"Spotify audio stream failed ({exc})")
             except HoldEnded:
                 # Revocation can race a play/pause call before the listener
                 # receives on_revoked. Treat the ended hold as a handoff.
@@ -191,8 +200,15 @@ class Service:
             if kind == "packet":
                 await self.producer.audio(event["length"])
             elif kind == "suspended" and event.get("id") == self.suspending:
-                self.suspending = None
+                if self.retry_handoff == self.suspending:
+                    # Old audio is fenced. Play reloads the track at the saved
+                    # position with fresh headers, capture and HTTP resource.
+                    self._command("resume")
+                self.suspending = self.retry_handoff = None
                 self.bridge_epoch = event.get("epoch", self.bridge_epoch)
+            elif kind == "paused":
+                # Spotify paused before the fence; resuming would override it.
+                self.retry_handoff = None
             if kind not in ("error", "ready"):
                 return
         if self.awaiting_play:
@@ -203,6 +219,11 @@ class Service:
                 return
         self.bridge_epoch = event.get("epoch", self.bridge_epoch)
         if kind == "error":
+            if event.get("code") == "track_unavailable":
+                # Spirc marks the track unavailable and skips it. This is also
+                # reported when preloading the next track fails mid-song.
+                logger.warning("%s", ERRORS["track_unavailable"])
+                return
             if event.get("code") == "authentication_failed":
                 self.restartable = False
             raise ProducerError(
@@ -270,8 +291,10 @@ class Service:
             self.captures.add(self.capture)
             self.started_at = self.last_feedback = time.monotonic()
         capture = self.capture
-        if pages and pages[-1].time_ms - capture.produced_ms > 1500:
-            raise InvalidOgg("Ogg packet exceeds the 1.5 second pacing allowance")
+        # The passthrough decoder writes one Ogg page per packet. Bound its
+        # media time so a single credit cannot bypass the read-ahead budget.
+        if pages and pages[-1].time_ms - capture.produced_ms > self.parser.max_page_ms:
+            raise InvalidOgg("Ogg packet exceeds the one-page pacing allowance")
         for page in pages:
             if page.bos and capture.available:
                 raise InvalidOgg("Unexpected chained stream without a track boundary")
@@ -350,11 +373,10 @@ class Service:
                 if c and self.pending and not self.awaiting_play:
                     packet_id, generation = self.pending
                     if not self.paused:
+                        stalled = None
                         if now - self.last_feedback > self.reader_timeout:
-                            raise ProducerError(
-                                "Renderer stopped reporting playback; Spotify stopped."
-                            )
-                        if (
+                            stalled = "Renderer stopped reporting playback"
+                        elif (
                             not c.readers
                             and not self.finished
                             # HTTP can finish before the last buffered audio.
@@ -363,9 +385,14 @@ class Service:
                             and not (c.complete and c.delivered == c.available)
                             and now - self.started_at > self.reader_timeout
                         ):
-                            raise ProducerError(
-                                "No renderer is reading Spotify audio; Spotify stopped."
-                            )
+                            stalled = "No renderer is reading Spotify audio"
+                        if stalled:
+                            # The output stalled, not librespot. A renderer
+                            # that lost its HTTP request cannot reopen an
+                            # unfinished capture, but a fresh load recovers.
+                            self._log_pacing(stalled)
+                            self._suspend_and_retry(stalled)
+                            continue
                         played = c.played_ms
                         # Feedback is in media milliseconds. Extrapolate for at most
                         # one second so stale renderer reports never fund production.
@@ -392,19 +419,22 @@ class Service:
                 str(exc) if isinstance(exc, ProducerError) else "Spotify pacing failed."
             )
             self.status = self.error
-            c = self.capture
-            logger.error(
-                "Spotify pacing stopped: %s; complete=%s, delivered=%s/%s, readers=%s, produced_ms=%s, played_ms=%s",
-                self.error,
-                c.complete if c else None,
-                c.delivered if c else None,
-                c.available if c else None,
-                len(c.readers) if c else 0,
-                c.produced_ms if c else None,
-                c.played_ms if c else None,
-            )
+            self._log_pacing(self.error)
             if self.task:
                 self.task.cancel()
+
+    def _log_pacing(self, message):
+        c = self.capture
+        logger.error(
+            "Spotify pacing stopped: %s; complete=%s, delivered=%s/%s, readers=%s, produced_ms=%s, played_ms=%s",
+            message,
+            c.complete if c else None,
+            c.delivered if c else None,
+            c.available if c else None,
+            len(c.readers) if c else 0,
+            c.produced_ms if c else None,
+            c.played_ms if c else None,
+        )
 
     def on_state(self, state):
         if self.closed or self.awaiting_play:
@@ -443,6 +473,26 @@ class Service:
     def _pause_for_output_error(self, message):
         self.on_revoked(RevokeReason.OUTPUT_LOST)
         self.output_error = self.status = message
+
+    def _suspend_and_retry(self, failure):
+        # Retry once per track. A repeated failure, such as a corrupt page at
+        # the same position, waits for Play instead of looping.
+        uri = self.metadata.get("uri")
+        # Resuming would override a Spotify pause; a paused user presses Play.
+        retry = not self.paused and (not self.retried or uri != self.retried_uri)
+        handoff = self.handoff_id
+        self._pause_for_output_error(
+            f"{failure}; retrying"
+            if retry
+            else f"{failure}; press Play in Spotify to retry"
+        )
+        if retry and self.handoff_id != handoff:
+            self.retried, self.retried_uri = True, uri
+            self.retry_handoff = self.handoff_id
+        logger.warning(
+            "Spotify playback suspended; %s",
+            "retrying once" if self.retry_handoff else "waiting for Play",
+        )
 
     def on_finished(self):
         if self.awaiting_play or not self.capture or not self.capture.complete:

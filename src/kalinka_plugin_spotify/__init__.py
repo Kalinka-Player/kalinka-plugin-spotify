@@ -49,7 +49,7 @@ class SpotifyConfig(ModuleConfig):
         default=2000, ge=500, le=5000, title="Read-ahead budget (ms)"
     )
     cache_limit_mib: int = Field(
-        default=32, ge=1, le=128, title="Temporary cache limit (MiB)"
+        default=64, ge=1, le=128, title="Temporary cache limit (MiB)"
     )
 
 

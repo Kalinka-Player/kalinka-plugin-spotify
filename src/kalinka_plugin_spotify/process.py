@@ -85,7 +85,7 @@ class Librespot:
                 "--name",
                 self.device_name,
                 "--bitrate",
-                "160",
+                "320",
                 "--cache",
                 str(self.state_directory),
                 "--disable-audio-cache",

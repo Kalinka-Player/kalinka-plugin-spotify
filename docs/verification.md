@@ -415,3 +415,44 @@ wheel in `dist/`. Only the freshly built wheel was packaged, and installed paths
 kept their expected permissions. Shell syntax, Python lint and workflow YAML
 checks passed. The GitHub workflow now builds and uploads the `.deb`; that remote
 workflow and an actual apt installation have not been run.
+
+A live session stopped with `Ogg packet exceeds the 1.5 second pacing
+allowance`, and the plugin restarted librespot, dropping the Connect device. The
+passthrough decoder mirrors Spotify's source pages. During digital silence each
+Vorbis packet is a couple of bytes, so a page reaches Ogg's 255-segment limit
+first. A libvorbis tone–silence–tone encode without a page-duration cap
+reproduced a 537-byte page spanning 5,921 ms (255 × 1,024 samples at 44.1 kHz).
+The allowance now comes from the Vorbis identification header: 255 packets of
+half a long block, 5,922 ms for 2048-sample blocks. Invalid block sizes are
+rejected. A synthetic silent stream fails with the old bound and plays with the
+new one; a page one packet longer is still rejected.
+
+Stream-level failures no longer restart the receiver. Invalid Ogg data, cache
+limit/write failures and pacer-detected renderer stalls use the existing
+suspension path. Unavailable-track reports, which librespot also sends for a
+failed next-track preload, are logged while Spotify skips the track. Failed
+acknowledgements, framing errors, process exit, authentication and protocol
+errors still restart or stop it. Tests cover recovery by Play on the same
+receiver for a stream discontinuity and a cache limit.
+
+These suspensions then retry once automatically: after the matching `suspended`
+marker, the plugin sends `resume`, which the patched Spirc already handles as a
+fresh load at the saved position. A second failure on the same track URI waits
+for Play, so a deterministic bad page cannot loop. Tests cover the retry, a stale
+marker not triggering it, the no-retry repeat failure, separate budgets for
+different tracks, a renderer stall retry, and no retry after a renderer decode
+error. All 145 plugin tests and Ruff lint/format checks pass. None of this has
+yet been confirmed with live Spotify playback.
+
+The receiver now requests 320 kbps (`--bitrate 320`), and the default capture
+cap is 64 MiB, about 28 minutes at that rate. Upstream's 320 kbps preference
+lists `MP3_320` and `MP3_256` before `OGG_VORBIS_160`, and a passthrough load of
+MP3 fails without trying another format. The patch therefore limits bridge-mode
+file selection to Ogg Vorbis, so a track without a 320 kbps file falls back to
+160 kbps. The regenerated patch differs only by that hunk and applies to a
+pristine checkout of the pinned revision. The release build succeeded, the
+offline verifier passed all four passthrough runs, and the 17 native `kalinka_`
+Connect tests passed. Lossless FLAC was not attempted: librespot cannot obtain
+its keys, and upstream has declined to support it
+([librespot#1583](https://github.com/librespot-org/librespot/issues/1583)).
+Playback at 320 kbps has not yet been checked with a live account.

@@ -10,8 +10,9 @@ from kalinka_plugin_sdk.direct_playback import (
 )
 from kalinka_server.live_content import serve
 from starlette.requests import Request
+from test_ogg import silent_stream
 
-from kalinka_plugin_spotify.ogg import InvalidOgg
+from kalinka_plugin_spotify.ogg import OggParser
 from kalinka_plugin_spotify.process import ProducerError
 from kalinka_plugin_spotify.service import Service
 
@@ -187,8 +188,13 @@ async def test_absent_renderer_does_not_receive_unlimited_credit(service, pages)
     service.reader_timeout = 0.01
     service.last_feedback -= 1
     service.changed.set()
-    await wait_until(lambda: service.error is not None)
-    assert "Renderer" in service.error
+    await wait_until(lambda: service.awaiting_play)
+    await service.release_task
+    # A stalled renderer is an output fault; Connect remains available.
+    assert "Renderer stopped reporting" in service.output_error
+    assert service.error is None and not service.closed
+    assert service.producer.commands[-1][0] == "suspend"
+    assert not service.producer.stopped
 
 
 async def test_pause_resume_while_buffer_full(service, pages):
@@ -317,8 +323,10 @@ async def test_reader_closing_after_delivery_waits_for_audible_end(
     service.pacer = asyncio.create_task(service._pace())
     await asyncio.sleep(0.02)
     if expected_error:
-        assert service.error == "No renderer is reading Spotify audio; Spotify stopped."
-        assert service.error in caplog.text
+        await wait_until(lambda: service.awaiting_play)
+        assert "No renderer is reading Spotify audio" in service.output_error
+        assert "No renderer is reading Spotify audio" in caplog.text
+        assert service.error is None and not service.closed
         return
 
     assert service.error is None
@@ -558,10 +566,115 @@ async def test_missing_output_pauses_receiver_and_play_retries(service, pages):
     assert service.hold is not None and service.play_started
 
 
-async def test_unannounced_boundary_rejected(service, pages):
-    await started(service, pages)
-    with pytest.raises(InvalidOgg):
+async def fail_stream(service, pages, index, failure):
+    if failure == "cache limit":
+        service.capture.max_bytes = service.capture.available
+        await feed(service, pages[index + 1], 100)
+    else:
+        # An unannounced stream boundary cannot be appended to this capture.
         await feed(service, pages[0], 100)
+    await service.release_task
+
+
+async def reload_after_suspension(service, pages, uri):
+    await service.event({"event": "suspended", "id": service.handoff_id})
+    await service.event({"event": "loading", "position_ms": 0})
+    await service.event(
+        {"event": "track", "title": "Retry", "uri": uri, "duration_ms": 8000}
+    )
+    await service.event({"event": "playing", "position_ms": 0})
+    return await started(service, pages)
+
+
+@pytest.mark.parametrize("failure", ["Discontinuity", "cache limit"])
+async def test_stream_failure_retries_once_without_restarting_librespot(
+    service, pages, failure
+):
+    service.start()
+    await wait_until(lambda: service.producer.starts == 1)
+    index = await started(service, pages)
+    old, hold = service.capture, service.hold
+    reader = await old.open(0, None)
+    await fail_stream(service, pages, index, failure)
+    assert failure in service.output_error and "retrying" in service.output_error
+    assert service.awaiting_play and service.error is None and not service.closed
+    assert old.retired and hold.released and service.hold is None
+    assert service.producer.commands[-1][0] == "suspend"
+    assert not any(op == "disconnect" for op, _ in service.producer.commands)
+    assert not service.task.done() and not service.producer.stopped
+    await reader.aclose()
+    assert old.file.closed
+
+    # The retry waits for the marker that fences old audio, then plays.
+    await service.event({"event": "suspended", "id": service.handoff_id - 1})
+    assert service.producer.commands[-1][0] == "suspend"
+    await service.event({"event": "suspended", "id": service.handoff_id})
+    await wait_until(lambda: service.producer.commands[-1] == ("resume", {}))
+    await service.event({"event": "loading", "position_ms": 0})
+    await service.event({"event": "track", "title": "Retry", "duration_ms": 8000})
+    await service.event({"event": "playing", "position_ms": 0})
+    index = await started(service, pages)
+    assert service.capture is not old and not service.awaiting_play
+    assert service.direct.acquisitions == 2
+
+    # The same track failing again waits for Play instead of looping.
+    await fail_stream(service, pages, index, failure)
+    assert "press Play" in service.output_error
+    commands = len(service.producer.commands)
+    await service.event({"event": "suspended", "id": service.handoff_id})
+    await asyncio.sleep(0.01)
+    assert len(service.producer.commands) == commands
+    assert service.awaiting_play and service.retry_handoff is None
+
+    # Play loads fresh headers into a new capture on the same receiver.
+    await service.event({"event": "loading", "position_ms": 0})
+    await service.event({"event": "track", "title": "Retry", "duration_ms": 8000})
+    await service.event({"event": "playing", "position_ms": 0})
+    await started(service, pages)
+    assert not service.awaiting_play and service.direct.acquisitions == 3
+    assert service.producer.starts == 1 and not service.producer.stopped
+
+
+async def test_stream_failure_while_paused_does_not_resume(service, pages):
+    service.start()
+    await wait_until(lambda: service.producer.starts == 1)
+    await started(service, pages)
+    await service.event({"event": "paused", "position_ms": 0})
+    await fail_stream(service, pages, 0, "Discontinuity")
+    assert "press Play" in service.output_error
+    commands = len(service.producer.commands)
+    await service.event({"event": "suspended", "id": service.handoff_id})
+    await asyncio.sleep(0.01)
+    assert len(service.producer.commands) == commands
+
+
+async def test_pause_before_suspension_marker_cancels_retry(service, pages):
+    service.start()
+    await wait_until(lambda: service.producer.starts == 1)
+    await started(service, pages)
+    await fail_stream(service, pages, 0, "Discontinuity")
+    assert "retrying" in service.output_error
+    commands = len(service.producer.commands)
+    await service.event({"event": "paused", "position_ms": 0})
+    await service.event({"event": "suspended", "id": service.handoff_id})
+    await asyncio.sleep(0.01)
+    assert len(service.producer.commands) == commands
+
+
+async def test_each_track_gets_its_own_automatic_retry(service, pages):
+    service.start()
+    await wait_until(lambda: service.producer.starts == 1)
+    await service.event({"event": "track", "title": "A", "uri": "spotify:track:a"})
+    index = await started(service, pages)
+    retried = []
+    for next_uri in ["spotify:track:a", "spotify:track:b", None]:
+        await fail_stream(service, pages, index, "Discontinuity")
+        retried.append("retrying" in service.output_error)
+        if next_uri:
+            index = await reload_after_suspension(service, pages, next_uri)
+    # A is retried, A again waits for Play, then B gets its own retry.
+    assert retried == [True, False, True]
+    assert service.producer.starts == 1 and not service.producer.stopped
 
 
 @pytest.mark.parametrize(
@@ -569,12 +682,29 @@ async def test_unannounced_boundary_rejected(service, pages):
     [
         ("authentication_failed", "authentication"),
         ("incompatible_format", "incompatible"),
-        ("track_unavailable", "Ogg/Vorbis"),
     ],
 )
 async def test_useful_process_failures(service, code, text):
     with pytest.raises(ProducerError, match=text):
         await service.event({"event": "error", "code": code})
+
+
+async def test_unavailable_next_track_does_not_stop_the_current_one(
+    service, pages, caplog
+):
+    service.start()
+    await wait_until(lambda: service.producer.starts == 1)
+    index = await started(service, pages)
+    capture, hold = service.capture, service.hold
+    # librespot reports a failed preload while the current track still plays;
+    # Spotify skips the unavailable track itself.
+    await service.event({"event": "error", "code": "track_unavailable"})
+    await feed(service, pages[index + 1], 100)
+    assert service.capture is capture and service.hold is hold
+    assert service.pending == (100, service.generation)
+    assert service.error is None and service.output_error is None
+    assert not service.task.done() and not service.producer.stopped
+    assert "could not load this track" in caplog.text
 
 
 @pytest.mark.parametrize("asgi_version", ["2.0", "2.4"])
@@ -735,12 +865,35 @@ async def test_disable_interrupts_waiting_for_retired_readers(service, pages):
 
 async def test_large_media_time_packet_cannot_bypass_credit_budget(service, pages):
     service.producer.data = b"".join(p.data for p in pages)
-    with pytest.raises(InvalidOgg, match="pacing allowance"):
-        await service.event(
-            {"event": "packet", "length": len(service.producer.data), "id": 1}
-        )
-    assert not service.play_started
-    assert service.capture.available == 0
+    await service.event(
+        {"event": "packet", "length": len(service.producer.data), "id": 1}
+    )
+    capture = service.capture
+    await service.release_task
+    assert not service.play_started and service.pending is None
+    assert capture.available == 0 and capture.retired
+    assert "pacing allowance" in service.output_error
+    assert service.error is None and not service.closed
+
+
+async def test_silent_pages_up_to_the_vorbis_limit_keep_playing(service, pages):
+    # Spotify's silent passages put 255 packets (5.9 s) in one Ogg page.
+    stream = OggParser().feed(silent_stream(pages, [255 * 1024, 510 * 1024]))
+    for i, page in enumerate(stream):
+        await feed(service, page, i + 1)
+    assert service.play_started and not service.awaiting_play
+    assert service.output_error is None and service.error is None
+    assert service.capture.produced_ms == 11842 and service.capture.complete
+
+
+async def test_page_longer_than_vorbis_allows_is_rejected(service, pages):
+    stream = OggParser().feed(silent_stream(pages, [256 * 1024]))
+    for i, page in enumerate(stream):
+        await feed(service, page, i + 1)
+    await service.release_task
+    assert not service.play_started and service.capture is None
+    assert "pacing allowance" in service.output_error
+    assert service.error is None and not service.closed
 
 
 async def test_renderer_volume_wins_over_spotify_cached_volume_on_acquire(
@@ -903,6 +1056,10 @@ async def test_renderer_error_keeps_connect_alive_and_preserves_position(
     )
     assert not service.task.done() and not service.producer.stopped
     assert all(command != "disconnect" for command, _ in service.producer.commands)
+    # An incompatible renderer would fail again; only Play retries it.
+    await service.event({"event": "suspended", "id": service.handoff_id})
+    await asyncio.sleep(0.01)
+    assert service.producer.commands[-1][0] == "suspend"
     plugin = KalinkaPluginSpotify()
     plugin.enabled, plugin.service = True, service
     health = await plugin.get_state()

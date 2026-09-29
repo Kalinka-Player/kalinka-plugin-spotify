@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 from kalinka_plugin_sdk.direct_playback import RevokeReason
-from test_service import Direct, Producer, started, wait_until
+from test_service import Direct, Producer, feed, started, wait_until
 
-from kalinka_plugin_spotify.process import Librespot
+from kalinka_plugin_spotify.process import Librespot, ProducerError
 from kalinka_plugin_spotify.service import Service
 from kalinka_plugin_spotify.supervisor import Supervisor
 
@@ -83,15 +83,36 @@ async def test_child_exit_interrupts_blocked_event_handler(receiver):
     assert sessions[0].task.done() and sessions[0].producer.stopped
 
 
+async def test_renderer_stall_suspends_without_restarting_discovery(receiver, pages):
+    supervisor, sessions = receiver
+    service = sessions[0]
+    await service.event({"event": "track", "title": "Track", "duration_ms": 8000})
+    await started(service, pages)
+    service.last_feedback -= service.reader_timeout + 1
+    service.changed.set()
+    await wait_until(lambda: service.awaiting_play)
+    await service.release_task
+    assert "Renderer stopped reporting" in supervisor.output_error
+    assert "retrying" in supervisor.output_error
+    assert supervisor.error is None and len(sessions) == 1
+    assert not service.producer.stopped and not service.task.done()
+    # A fresh load gives the renderer a new HTTP resource to open.
+    await service.event({"event": "suspended", "id": service.handoff_id})
+    await wait_until(lambda: service.producer.commands[-1] == ("resume", {}))
+
+
 async def test_pacing_failure_also_recovers_discovery(receiver, pages):
     _, sessions = receiver
     old = sessions[0]
+
+    async def broken_send(op, **fields):
+        raise ProducerError("librespot control connection is closed")
+
+    old.producer.send = broken_send
     await old.event({"event": "track", "title": "Track", "duration_ms": 8000})
-    await started(old, pages)
-    old.last_feedback -= old.reader_timeout + 1
-    old.changed.set()
+    await feed(old, pages[0], 1)
     await wait_until(lambda: len(sessions) == 2 and sessions[1].producer.starts)
-    assert "Renderer stopped reporting" in old.error
+    assert "control connection" in old.error
     assert old.producer.stopped
 
 
