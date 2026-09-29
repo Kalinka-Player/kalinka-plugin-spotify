@@ -1,13 +1,12 @@
 name: Companion Kalinka core
-description: Check out the pinned Kalinka core into ./core with the SDK 3.5 companion patch applied.
+description: Check out the pinned Kalinka core with merged SDK 3.5 live-stream support into ./core.
 runs:
   using: composite
   steps:
     - uses: actions/checkout@v4
       with:
         repository: Kalinka-Player/KalinkaPlayer
-        ref: 6162c0b0625bb41c2cb72d9c0509d6e0585b6057
+        # KalinkaPlayer PR #225: SDK, server and renderer live-stream support.
+        ref: ad91659ba259f9dbc195f3618653985116407263
         path: core
         fetch-depth: 0
-    - shell: bash
-      run: git -C core apply ../patches/kalinka-core-3.5.patch
