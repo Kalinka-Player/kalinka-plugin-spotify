@@ -476,3 +476,10 @@ rebuilt binary reported `service_unavailable` and kept the credentials. The
 regenerated patch applies to a pristine checkout, the offline verifier passed,
 and tests cover both bridge generations, the slower backoff and credential
 removal.
+
+Settings now offer **Unpair Spotify account on next restart**. It is a one-shot
+setting in the same style as the Qobuz plugin's unpair option: the server clears
+it on disk before setup acts, and setup deletes only `credentials.json`, whether
+or not Spotify is enabled. Tests save it through the server's settings API,
+confirm the server treats it as an armed one-shot trigger, and check that other
+state files are kept.

@@ -91,6 +91,11 @@ the saved sign-in itself, the plugin forgets it and the receiver restarts ready
 for pairing: select Kalinka in the Spotify app. Older bridge builds report both
 cases alike, so with them the plugin retries without forgetting the sign-in.
 
+To pair another account or pair again by hand, turn on **Unpair Spotify account
+on next restart** in the plugin settings and restart Kalinka. The saved sign-in
+is deleted once and the setting turns itself off; the receiver then waits for
+pairing, so select Kalinka in the Spotify app with a Premium account.
+
 Normal buffering, pause and queue handoff do not restart the receiver. Disabling
 the plugin or shutting down Kalinka cancels retries and stops its child. Missing
 or incompatible executables and startup failures remain visible settings errors

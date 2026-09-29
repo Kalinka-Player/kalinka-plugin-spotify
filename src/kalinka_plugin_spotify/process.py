@@ -15,6 +15,11 @@ class ProducerError(RuntimeError):
     pass
 
 
+def forget_credentials(state_directory: Path):
+    # Without saved credentials librespot waits for pairing in the app.
+    (state_directory / "credentials.json").unlink(missing_ok=True)
+
+
 class Librespot:
     def __init__(self, executable, device_name, state_directory: Path):
         self.executable = executable
@@ -136,8 +141,7 @@ class Librespot:
         raise ProducerError("librespot control connection closed.")
 
     def forget_credentials(self):
-        # Without saved credentials librespot waits for pairing in the app.
-        (self.state_directory / "credentials.json").unlink(missing_ok=True)
+        forget_credentials(self.state_directory)
 
     async def wait(self):
         process = self.process

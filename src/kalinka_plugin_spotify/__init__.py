@@ -13,7 +13,7 @@ from kalinka_plugin_sdk.module_health import ModuleHealthState, ModuleState
 from kalinka_plugin_sdk.plugin import InputModulePlugin
 from pydantic import Field
 
-from .process import Librespot
+from .process import Librespot, forget_credentials
 from .service import Service
 from .supervisor import Supervisor
 
@@ -43,6 +43,21 @@ class SpotifyConfig(ModuleConfig):
         title="Spotify device name",
         description="Name shown in Spotify's device list. Choose the output in Kalinka's renderer selector.",
         json_schema_extra={"importance": "simple"},
+    )
+    unpair: bool = Field(
+        default=False,
+        title="Unpair Spotify account on next restart",
+        json_schema_extra={
+            "help": (
+                "Forget the saved Spotify sign-in, then wait for a new pairing: "
+                "select this device in the Spotify app with a Premium account. "
+                "Resets itself once done."
+            ),
+            # One-shot trigger: the framework resets this (persist-first)
+            # before the plugin acts, so it fires at most once per arming.
+            "one_shot": True,
+            "importance": "simple",
+        },
     )
     executable: str = Field(default=BUNDLED_LIBRESPOT, title="librespot executable")
     read_ahead_ms: int = Field(
@@ -101,6 +116,10 @@ class KalinkaPluginSpotify(InputModulePlugin):
     async def setup(self, context):
         config = SpotifyConfig(**context.config.model_dump())
         self.enabled = config.enabled
+        state_directory = Path(paths.state_dir()) / "spotify"
+        if config.unpair:
+            # librespot then starts without a sign-in and waits for pairing.
+            forget_credentials(state_directory)
         if not config.enabled:
             return
         if context.direct_playback is None:
@@ -110,11 +129,7 @@ class KalinkaPluginSpotify(InputModulePlugin):
         self.service = Supervisor(
             lambda: Service(
                 context.direct_playback,
-                Librespot(
-                    config.executable,
-                    config.device_name,
-                    Path(paths.state_dir()) / "spotify",
-                ),
+                Librespot(config.executable, config.device_name, state_directory),
                 Path(paths.cache_dir()) / "spotify",
                 budget_ms=config.read_ahead_ms,
                 max_bytes=config.cache_limit_mib * 1024 * 1024,
