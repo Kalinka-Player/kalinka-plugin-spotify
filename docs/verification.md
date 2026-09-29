@@ -4,6 +4,14 @@ Checks run locally on 2026-09-28 and 2026-09-29. Offline checks used no Spotify 
 User-assisted local connection checks are recorded below; remote-speaker
 playback remains unverified.
 
+The latest request-error fix retires superseded captures without raising an
+`OSError` while their renderer still has an HTTP request open. Reads stop and
+wait for the actual disconnect; no EOF is fabricated. The server now watches
+disconnects even on ASGI 2.4 while a live reader is waiting for bytes, and
+distinguishes a closed output socket from a real source-read failure. The new
+seek, track-change, stop and disable regressions failed before the fix and pass
+afterward. All 104 plugin tests and 122 relevant core tests pass.
+
 On 2026-09-29, the renderer's unknown-format fallback was replaced with an
 `Unsupported stream format` decoder error. Regression tests verify rejection
 before an HTTP request, the faulted source token in events and snapshots,
@@ -25,7 +33,7 @@ has not yet been confirmed. The Spotify receiver remains on the development host
 
 | Check | Result |
 | --- | --- |
-| Plugin pytest suite | 95 passed |
+| Plugin pytest suite | 104 passed after the retired-reader fix |
 | Plugin Ruff lint/format | Passed |
 | Plugin wheel and source archive | Built successfully |
 | Debian plugin package | `kalinka-plugin-spotify_0.1.0_all.deb` built and inspected successfully |

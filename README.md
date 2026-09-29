@@ -141,7 +141,10 @@ Audio starts after valid Vorbis headers and the first timed Ogg audio page,
 without waiting for the whole track. Each seek/skip creates an independently
 decodable stream and a new immutable URL. Pause stops the renderer immediately,
 including when production is waiting for credit. Resume continues the same
-resource. A discontinuity cancels old readers and replaces renderer read-ahead.
+resource. A discontinuity retires the old capture and replaces renderer read-ahead.
+Retired readers stop delivering bytes and wait for the renderer to close its HTTP
+request; they do not fabricate EOF or raise a read failure during a normal seek,
+skip or shutdown. Actual source failures still abort the response.
 
 The default media read-ahead budget is **2 seconds**, adjustable from 0.5–5
 seconds. Credit is based on actual renderer playback snapshots, polled once a

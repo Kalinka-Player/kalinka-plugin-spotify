@@ -134,7 +134,10 @@ class Service:
         self.play_started = self.finished = False
         self.state = None
         if self.capture:
-            await self.capture.retire()
+            # Stop serving bytes, but let replacing/releasing the renderer
+            # close its HTTP request. Raising a read error first races that
+            # disconnect and logs an ASGI failure on every seek or skip.
+            await self.capture.retire(wait_for_disconnect=True)
             self.capture = None
         self.parser = OggParser()
         self.changed.set()
@@ -563,7 +566,7 @@ class Service:
             task.cancel()
         await asyncio.gather(*self.commands, return_exceptions=True)
         for capture in self.captures:
-            await capture.retire(self.error)
+            await capture.retire(self.error, wait_for_disconnect=self.error is None)
         try:
             await self.producer.send("disconnect")
         except Exception:
