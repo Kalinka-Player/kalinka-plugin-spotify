@@ -34,7 +34,7 @@ Build/install the modified renderer using Kalinka's normal renderer build and
 packaging instructions. Install SDK and server together. An SDK-only upgrade
 is insufficient: the server must understand `ContentInfo.live`, and the
 renderer must recognise `X-Kalinka-Live: 1` and unknown length and report advancing
-playback snapshots. The plugin's architecture-independent `.deb` does not replace
+playback snapshots. The plugin's `.deb` does not replace
 the native renderer executable.
 
 Unsupported-format reporting also requires a renderer upgrade on each device.

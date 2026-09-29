@@ -17,6 +17,8 @@ from .process import Librespot
 from .service import Service
 from .supervisor import Supervisor
 
+BUNDLED_LIBRESPOT = "/usr/libexec/kalinka-plugin-spotify/librespot"
+
 
 class SpotifyConfig(ModuleConfig):
     __module_icon__: ClassVar[str] = "music_note_outlined"
@@ -42,7 +44,7 @@ class SpotifyConfig(ModuleConfig):
         description="Name shown in Spotify's device list. Choose the output in Kalinka's renderer selector.",
         json_schema_extra={"importance": "simple"},
     )
-    executable: str = Field(default="librespot", title="librespot executable")
+    executable: str = Field(default=BUNDLED_LIBRESPOT, title="librespot executable")
     read_ahead_ms: int = Field(
         default=2000, ge=500, le=5000, title="Read-ahead budget (ms)"
     )

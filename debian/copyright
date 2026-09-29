@@ -5,6 +5,17 @@ Source: https://github.com/Kalinka-Player/kalinka-plugin-spotify
 Files: *
 Copyright: 2026 Kalinka contributors
 License: MIT
+
+Files: usr/libexec/kalinka-plugin-spotify/librespot
+Copyright: 2015 Paul Lietar
+ librespot-org contributors
+ 2026 Kalinka contributors (Kalinka pipe bridge patch)
+License: MIT
+Comment: librespot 0.8.0, https://github.com/librespot-org/librespot,
+ revision d36f9f1907e8cc9d68a93f8ebc6b627b1bf7267d with
+ patches/librespot-0.8.0-kalinka.patch from the plugin's source repository.
+
+License: MIT
  Permission is hereby granted, free of charge, to any person obtaining a copy
  of this software and associated documentation files (the "Software"), to deal
  in the Software without restriction, including without limitation the rights
