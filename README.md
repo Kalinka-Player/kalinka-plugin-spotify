@@ -89,7 +89,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install build
 ./scripts/build_deb.sh
-sudo apt install ./kalinka-plugin-spotify_0.1.0_all.deb
+sudo apt install ./kalinka-plugin-spotify_0.1.1_all.deb
 ```
 
 `build_deb.sh` reads the version from the freshly built wheel and writes the
@@ -159,9 +159,12 @@ after 30 seconds; pausing does not grant further credit.
 The capture is a private temporary file with a **32 MiB per-generation cap**
 (adjustable to 128 MiB). At most two generations can remain pinned across a
 seek, for a default **64 MiB disk cap**, and at most two readers per generation.
-No earlier bytes are evicted or substituted. Exceeding a cap fails explicitly;
-very long tracks may need a larger setting. Files are unlinked temporary
-storage, outside music scanning, and close after the last reader releases them.
+Rapid seeks wait up to five seconds for an old reader to close before allocating
+another capture. If cleanup stalls, playback pauses and Spotify Connect stays
+available; press Play to retry. No earlier bytes are evicted or substituted.
+Exceeding a track's byte cap fails explicitly; very long tracks may need a larger
+setting. Files are unlinked temporary storage, outside music scanning, and close
+after the last reader releases them.
 Memory holds bounded control messages, one compressed packet (max 1 MiB), Ogg
 framing state and small I/O chunks. It never accumulates a whole track in RAM.
 

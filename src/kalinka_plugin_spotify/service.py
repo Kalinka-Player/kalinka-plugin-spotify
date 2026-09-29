@@ -46,10 +46,12 @@ class Service:
         budget_ms=2000,
         max_bytes=32 * 1024 * 1024,
         reader_timeout=30,
+        reader_close_timeout=5,
     ):
         self.direct, self.producer = direct, producer
         self.budget_ms, self.max_bytes = budget_ms, max_bytes
         self.reader_timeout = reader_timeout
+        self.reader_close_timeout = reader_close_timeout
         cache_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         cache_directory.chmod(0o700)
         self.directory = tempfile.TemporaryDirectory(
@@ -241,11 +243,8 @@ class Service:
         if self.capture is None:
             if not self.metadata:
                 raise InvalidOgg("Audio arrived without track metadata")
-            self.captures = {c for c in self.captures if not c.file.closed}
-            if len(self.captures) >= 2:
-                raise ProducerError(
-                    "Previous renderer readers still hold the playback cache; reconnect Spotify."
-                )
+            if not await self._wait_for_capture_slot():
+                return
             self.capture = Capture(
                 Path(self.directory.name),
                 max_bytes=self.max_bytes,
@@ -297,6 +296,34 @@ class Service:
             return
         self.pending = (event["id"], self.generation)
         self.changed.set()
+
+    async def _wait_for_capture_slot(self):
+        self.captures = {c for c in self.captures if not c.file.closed}
+        if len(self.captures) < 2:
+            return True
+        # Rapid seeks can overtake the renderer's HTTP disconnects. Hold back
+        # the next packet's credit until either retired file is unpinned, rather
+        # than exceeding the cache bound or shutting down the Connect receiver.
+        closing = [asyncio.create_task(c.wait_closed()) for c in self.captures]
+        try:
+            await asyncio.wait(
+                closing,
+                timeout=self.reader_close_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in closing:
+                task.cancel()
+            await asyncio.gather(*closing, return_exceptions=True)
+        self.captures = {c for c in self.captures if not c.file.closed}
+        if len(self.captures) >= 2:
+            logger.warning("Spotify renderer streams did not close; pausing playback")
+            self._pause_for_output_error(
+                "Renderer is still closing previous Spotify streams; "
+                "press Play in Spotify to retry"
+            )
+            return False
+        return True
 
     async def _pace(self):
         try:

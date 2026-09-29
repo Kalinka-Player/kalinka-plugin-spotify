@@ -4,6 +4,17 @@ Checks run locally on 2026-09-28 and 2026-09-29. Offline checks used no Spotify 
 User-assisted local connection checks are recorded below; remote-speaker
 playback remains unverified.
 
+On 2026-09-29 at 02:51:44 BST, repeated seeks on the Pi exhausted the two-capture
+limit while previous HTTP readers were still closing. The plugin raised
+`Previous renderer readers still hold the playback cache` and stopped its native
+receiver; the Kalinka server and renderer remained running. Version 0.1.1 waits
+up to five seconds for either retired capture to close. A timeout pauses and
+releases the output while keeping Spotify Connect alive, with Play available to
+retry. The disk limit and unfinished-stream HTTP semantics are unchanged.
+Five regression cases failed before the fix. All 110 plugin tests now pass,
+including delayed disconnects on ASGI 2.0/2.4, 20 alternating rapid seeks,
+timeout/retry without restarting the producer, and disabling during the wait.
+
 The latest request-error fix retires superseded captures without raising an
 `OSError` while their renderer still has an HTTP request open. Reads stop and
 wait for the actual disconnect; no EOF is fabricated. The server now watches
@@ -33,7 +44,7 @@ has not yet been confirmed. The Spotify receiver remains on the development host
 
 | Check | Result |
 | --- | --- |
-| Plugin pytest suite | 104 passed after the retired-reader fix |
+| Plugin pytest suite | 110 passed after the rapid-seek reader fix |
 | Plugin Ruff lint/format | Passed |
 | Plugin wheel and source archive | Built successfully |
 | Debian plugin package | `kalinka-plugin-spotify_0.1.0_all.deb` built and inspected successfully |
