@@ -3,8 +3,12 @@
 import asyncio
 import json
 import os
+import signal
 import socket
 from pathlib import Path
+
+GRACEFUL_STOP_TIMEOUT = 3
+TERMINATE_TIMEOUT = 1
 
 
 class ProducerError(RuntimeError):
@@ -28,6 +32,7 @@ class Librespot:
                 "--kalinka-capabilities",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
             )
         except FileNotFoundError:
             raise ProducerError(
@@ -91,6 +96,9 @@ class Librespot:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 pass_fds=(child.fileno(),),
+                # The server owns shutdown. A terminal Ctrl+C must not kill
+                # this child before the plugin can retire its HTTP streams.
+                start_new_session=True,
                 env=env,
                 umask=0o077,
                 limit=128 * 1024,
@@ -104,11 +112,10 @@ class Librespot:
             raise
         finally:
             child.close()
-        self.stderr_task = asyncio.create_task(self._drain_stderr())
+        self.stderr_task = asyncio.create_task(self._drain_stderr(self.process))
 
-    async def _drain_stderr(self):
+    async def _drain_stderr(self, process):
         # Human logs are neither a control protocol nor safe credential output.
-        process = self.process
         while await process.stderr.read(16 * 1024):
             pass
 
@@ -160,26 +167,47 @@ class Librespot:
 
     async def stop(self):
         process, self.process = self.process, None
-        if process is not None and process.returncode is None:
-            # Only this plugin's child; no process-name matching or sound-card control.
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                await asyncio.wait_for(process.wait(), 3)
-            except TimeoutError:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-                await process.wait()
         if process is not None:
-            # Once event/audio handling has stopped, finish draining our own
-            # stdout transport too. A killed child can leave it paused at the
-            # StreamReader limit; retaining it would leak a pipe on each retry.
-            while await process.stdout.read(64 * 1024):
-                pass
+            # Playback consumers have stopped. Keep draining both lanes so a
+            # final audio packet or control event cannot block native teardown.
+            async def drain(reader):
+                while await reader.read(64 * 1024):
+                    pass
+
+            drains = [
+                asyncio.create_task(drain(reader))
+                for reader in (process.stdout, self.reader)
+                if reader is not None
+            ]
+            try:
+                # librespot's graceful shutdown handler listens for SIGINT.
+                # Escalate only if this owned child does not exit in time.
+                for sig, timeout in (
+                    (signal.SIGINT, GRACEFUL_STOP_TIMEOUT),
+                    (signal.SIGTERM, TERMINATE_TIMEOUT),
+                ):
+                    if process.returncode is not None:
+                        break
+                    try:
+                        process.send_signal(sig)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout)
+                        break
+                    except TimeoutError:
+                        pass
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    await process.wait()
+                await asyncio.gather(*drains, return_exceptions=True)
+            finally:
+                for task in drains:
+                    task.cancel()
+                await asyncio.gather(*drains, return_exceptions=True)
         if self.writer is not None:
             self.writer.close()
             try:

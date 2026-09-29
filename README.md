@@ -76,6 +76,12 @@ or incompatible executables, startup failures and explicit authentication errors
 remain visible settings errors requiring correction. This watches process exit
 and session failures; it does not treat an idle receiver as an unresponsive one.
 
+The receiver and capability probe run outside the server's terminal process
+group, so Ctrl+C lets Kalinka shut down its streams before stopping librespot.
+The plugin requests graceful receiver shutdown and continues draining its pipes;
+it escalates to termination after three seconds and kill after one more second
+only if the child remains running.
+
 If the selected renderer cannot play the stream, Spotify pauses and the plugin
 shows an output warning while keeping the Connect receiver available. Select a
 compatible renderer in Kalinka and press Play in Spotify to retry.
