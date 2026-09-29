@@ -54,6 +54,8 @@ on PATH). Select a renderer through Kalinka's usual output selector, set a
 device name, enable Spotify Connect and restart the plugin using Kalinka's
 settings. The Spotify device name identifies the Connect receiver; output
 selection stays in Kalinka's normal renderer selector.
+The default device name is `Kalinka (<hostname>)`, for example
+`Kalinka (raspberrypi)`. An explicitly configured device name takes precedence.
 
 The executable is checked on every start. A stock executable without the
 Kalinka bridge or a build without passthrough fails with a settings error.

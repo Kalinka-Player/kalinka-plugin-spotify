@@ -1,5 +1,6 @@
 """Optional server-side Spotify Connect input for Kalinka."""
 
+import socket
 from pathlib import Path
 from typing import ClassVar
 
@@ -34,7 +35,7 @@ class SpotifyConfig(ModuleConfig):
         json_schema_extra={"importance": "simple"},
     )
     device_name: str = Field(
-        default="Kalinka",
+        default_factory=lambda: f"Kalinka ({socket.gethostname()})",
         min_length=1,
         max_length=100,
         title="Spotify device name",
