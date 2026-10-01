@@ -13,7 +13,7 @@ Spotify app ── Connect ── librespot 0.8.0 + small pipe bridge
                               │ Kalinka /content/spotify/<generation>
                               ▼
                      selected Kalinka renderer → audio output
-                              │ actual playback snapshots
+                              │ timestamped playback state changes
                               └── plugin pacing / Spotify progress feedback
 ```
 
@@ -201,17 +201,21 @@ request; they do not fabricate EOF or raise a read failure during a normal seek,
 skip or shutdown. Actual source failures still abort the response.
 
 The default media read-ahead budget is **2 seconds**, adjustable from 0.5–5
-seconds. Credit is based on actual renderer playback snapshots, polled once a
-second, with at most one second of extrapolation. One producer packet, a single
+seconds. The plugin advances a local monotonic clock from the renderer's
+timestamped playback state changes, correcting it at each new control point.
+Pause and buffering freeze the clock; seeks replace it. No periodic renderer
+events or snapshot requests are needed. One producer packet, a single
 Ogg page, can be in flight beyond that budget. Music pages span a fraction of a
 second, but silence packs up to 255 tiny Vorbis packets into one page: 5.9
 seconds for Spotify's 44.1 kHz streams. Packets spanning more media time than
-one page can carry are rejected. Default steady-state maximum lead is therefore
-about **3.5 seconds** during music and up to **9 seconds** across silence, plus
-control/network scheduling. Produced bytes, HTTP-delivered bytes and
-played milliseconds are tracked separately. The renderer's time also corrects
-Spotify's Connect clock once a second. Missing readers or feedback pause playback
-after 30 seconds; pausing does not grant further credit.
+one page can carry are rejected. Production is bounded to the estimated playback
+position plus the budget and one page; clock error and control/network scheduling
+affect the audible lead. Produced bytes, HTTP-delivered bytes and played
+milliseconds are tracked separately. The plugin's timer also updates Spotify's
+Connect clock once a second without publishing playback-state events. Missing
+readers pause playback after 30 seconds; output loss and errors use the normal
+renderer callbacks. Quiet playback is not a feedback timeout. Pausing does not
+grant further credit.
 
 The capture is a private temporary file with a **64 MiB per-generation cap**,
 about 28 minutes at 320 kbps (adjustable to 128 MiB). At most two generations can

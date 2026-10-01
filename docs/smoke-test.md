@@ -35,8 +35,12 @@ renderer. They were **not run** by the offline test suite.
    previous in both apps. Each discontinuity needs a new URL and valid headers.
    Confirm there is no burst of stale audio and displayed time includes the
    upstream seek position. A seek near the end must not hang indefinitely.
-8. Slow or disconnect the renderer network. Production must stop gaining credit
-   and fail within the 30-second absent-reader/feedback budget. Restore it and
+8. Play uninterrupted for several minutes with server snapshot polling removed.
+   Spotify progress must advance and no per-second playback-state events should
+   reach Kalinka clients. Pause or induce buffering, then resume: the clock must
+   freeze and restart from the renderer's new position without a production burst.
+   Slow or disconnect the renderer network. Output-loss callbacks must suspend
+   playback; an absent HTTP reader must fail after 30 seconds. Restore it and
    explicitly restart Spotify playback as directed by status. A reconnect must
    never replay the beginning of an old generation silently.
 9. Start an ordinary Kalinka source. Confirm Spotify pauses with Kalinka still
