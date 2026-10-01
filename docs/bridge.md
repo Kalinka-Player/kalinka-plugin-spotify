@@ -87,8 +87,12 @@ Only one compressed packet may be unacknowledged. Credit gates the player's
 **next decoder read** through an `AtomicWaker`, after its command/load handling.
 It does not block the sink or the command lane. The plugin drains stdout into
 bounded storage regardless of the renderer's read rate, then withholds credit
-based on Ogg granule time and renderer feedback. A command can interrupt the
-wait, and a generation change drops obsolete credit. A broken supervisor exits
+based on Ogg granule time and a local clock anchored to timestamped renderer
+state changes. The clock advances only during playback, freezes during pause
+or buffering, and is corrected by each new control point. The plugin's timer
+reports progress once a second even when the renderer emits no events.
+A command can interrupt the wait, and a generation change drops obsolete
+credit. A broken supervisor exits
 the child; control writes have a two-second timeout. Local command queues are
 bounded. Progress corrects the Connect clock without moving the decoder cursor;
 stale epoch feedback is ignored.

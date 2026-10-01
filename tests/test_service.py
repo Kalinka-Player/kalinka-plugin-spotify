@@ -191,12 +191,12 @@ async def test_absent_renderer_does_not_receive_unlimited_credit(service, pages)
     await asyncio.sleep(0.03)
     assert not service.producer.commands
     service.reader_timeout = 0.01
-    service.last_feedback -= 1
+    service.started_at -= 1
     service.changed.set()
     await wait_until(lambda: service.awaiting_play)
     await service.release_task
     # A stalled renderer is an output fault; Connect remains available.
-    assert "Renderer stopped reporting" in service.output_error
+    assert "No renderer is reading" in service.output_error
     assert service.error is None and not service.closed
     assert service.producer.commands[-1][0] == "suspend"
     assert not service.producer.stopped

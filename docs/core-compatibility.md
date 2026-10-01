@@ -10,7 +10,7 @@ merge commit `ad91659ba259f9dbc195f3618653985116407263`.
 | Component | Change |
 | --- | --- |
 | SDK 3.5 | `ContentInfo.live`, `LiveContent`/`LiveReader` protocol, explicit HTTP read errors; `TrackSource.sequential` and `timeline_offset_ms` |
-| Server | Serve asynchronous unfinished content without a final length; accept bounded initial range probes with a full live response; poll renderer snapshots for sequential direct playback; report timeline offsets; revoke sequential holds on target changes/reconnects; fence stale stream callbacks |
+| Server | Serve asynchronous unfinished content without a final length; accept bounded initial range probes with a full live response; send timestamped playback control points; report timeline offsets; revoke sequential holds on target changes/reconnects; fence stale stream callbacks |
 | Renderer | Treat unknown HTTP length as unknown, parse ordinary finite Content-Length, accept live chunked responses, allow an explicitly live response to wait during pause, let the existing Vorbis decoder consume short reads without waiting for a full input buffer, report current playback position in snapshots, preserve the position when refilling after a stall, and reject unknown formats with `Unsupported stream format` instead of falling back to FLAC |
 
 Kalinka's existing Ogg/Vorbis decoder is used, with its input callback adjusted
@@ -26,6 +26,14 @@ and install its SDK and server:
 ```sh
 python -m pip install -e packages/kalinka-plugin-sdk -e packages/kalinka-server
 ```
+
+The original server also polls sequential playback once a second. The Spotify
+plugin now keeps its own clock from timestamped control points and works with
+either server behavior. Removing those requests and the resulting public event
+ticks requires the companion server update in `direct_playback.py` and
+`renderer_player.py`. Upgrade the plugin before removing the server's polling:
+older plugin versions stop advancing credit without periodic feedback. No new
+renderer event or SDK field is required.
 
 Build/install the renderer from that checkout using Kalinka's normal build and
 packaging instructions. Install SDK and server together. An SDK-only upgrade

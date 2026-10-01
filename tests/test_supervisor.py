@@ -88,11 +88,11 @@ async def test_renderer_stall_suspends_without_restarting_discovery(receiver, pa
     service = sessions[0]
     await service.event({"event": "track", "title": "Track", "duration_ms": 8000})
     await started(service, pages)
-    service.last_feedback -= service.reader_timeout + 1
+    service.started_at -= service.reader_timeout + 1
     service.changed.set()
     await wait_until(lambda: service.awaiting_play)
     await service.release_task
-    assert "Renderer stopped reporting" in supervisor.output_error
+    assert "No renderer is reading" in supervisor.output_error
     assert "retrying" in supervisor.output_error
     assert supervisor.error is None and len(sessions) == 1
     assert not service.producer.stopped and not service.task.done()

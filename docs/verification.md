@@ -487,3 +487,31 @@ it on disk before setup acts, and setup deletes only `credentials.json`, whether
 or not Spotify is enabled. Tests save it through the server's settings API,
 confirm the server treats it as an armed one-shot trigger, and check that other
 state files are kept.
+
+## Playback clock without renderer polling (2026-10-01)
+
+The plugin now advances from the timestamp on each renderer control point,
+using a local monotonic timer for packet credit and Spotify progress reports.
+New control points correct the estimate; debug logs report the correction in
+milliseconds. Pause and buffering freeze the clock, seeks discard its anchor,
+and handoff uses the current estimate instead of the last reported position.
+The one-second extrapolation cap and missing-feedback timeout are removed.
+Reader-loss checks and the renderer's actual finished callback are retained.
+
+The companion Kalinka server change removes sequential-playback snapshot
+polling and same-state snapshot publication. The server regression verifies
+that uninterrupted playback produces neither snapshot requests nor public
+state ticks, while pause/resume still reach the plugin and clients.
+
+Validation: all 166 plugin tests passed, as did 97 companion server tests for
+direct playback, renderer state, reconnection and clock translation. Plugin
+Ruff lint and formatting checks passed. The clock regressions cover timer-only
+pacing beyond 30 seconds, delayed callbacks, clock correction, pause/buffering,
+seek offsets, stale callbacks, handoff position, missing positions, and waiting
+for audible completion after HTTP delivery. These are simulated tests; live
+Spotify and remote-renderer listening checks remain in `smoke-test.md`.
+
+Upgrade the plugin before deploying the server's polling removal. Older
+plugins require those snapshots. Spotify issue #4 remains separate: capture
+IDs are still used to reject obsolete callbacks, so seeking still changes the
+public track identity.

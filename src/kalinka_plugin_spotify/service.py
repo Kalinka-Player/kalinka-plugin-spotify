@@ -83,9 +83,9 @@ class Service:
         self.status = "Waiting for Spotify"
         self.offset_ms = 0
         self.state = None
+        self.state_at_ns = 0
         self.changed = asyncio.Event()
         self.started_at = time.monotonic()
-        self.last_feedback = self.started_at
         self.feedback_sent_at = 0.0
         self.finished = False
         self.play_started = False
@@ -160,6 +160,7 @@ class Service:
         self.pending = None
         self.play_started = self.finished = False
         self.state = None
+        self.state_at_ns = 0
         if self.capture:
             # Stop serving bytes, but let replacing/releasing the renderer
             # close its HTTP request. Raising a read error first races that
@@ -304,7 +305,7 @@ class Service:
                 offset_ms=self.offset_ms,
             )
             self.captures.add(self.capture)
-            self.started_at = self.last_feedback = time.monotonic()
+            self.started_at = time.monotonic()
         capture = self.capture
         # The passthrough decoder writes one Ogg page per packet. Bound its
         # media time so a single credit cannot bypass the read-ahead budget.
@@ -379,19 +380,60 @@ class Service:
             return False
         return True
 
+    def _position_at(self, now_ns):
+        """Advance the last renderer control point on the server's clock.
+
+        DirectPlayback timestamps use the same host's monotonic clock, even
+        for a remote renderer. Timer scheduling and callback delivery delays
+        therefore do not accumulate in the playback position.
+        """
+        c = self.capture
+        if self.finished and c:
+            return c.offset_ms + c.produced_ms
+        if not self.state or self.state.position is None:
+            return c.offset_ms + c.played_ms if c else self.offset_ms
+        position = self.state.position
+        if self.state.state == PlayerStateEnum.PLAYING:
+            elapsed = max(0, (now_ns - self.state_at_ns) // 1_000_000)
+            # Never predict playback of audio we have not produced. A renderer
+            # buffering event supplies the next frozen control point.
+            if c:
+                elapsed = min(elapsed, max(0, c.offset_ms + c.produced_ms - position))
+            position += elapsed
+        return max(0, position)
+
+    def _report_progress(self, now_ns, *, force=False):
+        if (
+            not self.capture
+            or self.awaiting_play
+            or not self.state
+            or self.state.position is None
+        ):
+            return
+        now = now_ns / 1_000_000_000
+        if force or now - self.feedback_sent_at >= 1:
+            self.feedback_sent_at = now
+            self._command(
+                "progress",
+                position_ms=self._position_at(now_ns),
+                epoch=self.bridge_epoch,
+            )
+
     async def _pace(self):
         try:
             while not self.closed:
                 self.changed.clear()
-                now = time.monotonic()
+                now_ns = time.monotonic_ns()
+                now = now_ns / 1_000_000_000
                 c = self.capture
+                if c and not self.awaiting_play:
+                    c.played_ms = max(0, self._position_at(now_ns) - c.offset_ms)
+                    self._report_progress(now_ns)
                 if c and self.pending and not self.awaiting_play:
                     packet_id, generation = self.pending
                     if not self.paused:
                         stalled = None
-                        if now - self.last_feedback > self.reader_timeout:
-                            stalled = "Renderer stopped reporting playback"
-                        elif (
+                        if (
                             not c.readers
                             and not self.finished
                             # HTTP can finish before the last buffered audio.
@@ -408,13 +450,9 @@ class Service:
                             self._log_pacing(stalled)
                             self._suspend_and_retry(stalled)
                             continue
-                        played = c.played_ms
-                        # Feedback is in media milliseconds. Extrapolate for at most
-                        # one second so stale renderer reports never fund production.
-                        if self.state and self.state.state == PlayerStateEnum.PLAYING:
-                            played += min(1000, int((now - self.last_feedback) * 1000))
                         allowed = not self.play_started or (
-                            bool(c.readers) and c.produced_ms <= played + self.budget_ms
+                            bool(c.readers)
+                            and c.produced_ms <= c.played_ms + self.budget_ms
                         )
                         # Hold the last packet's credit until audible completion.
                         # This prevents librespot advancing to the next track early.
@@ -470,19 +508,19 @@ class Service:
                 "and press Play in Spotify to retry"
             )
             return
+        now_ns = time.monotonic_ns()
+        at_ns = state.timestamp_ns or now_ns
+        if self.state and state.position is not None:
+            logger.debug(
+                "Spotify playback clock correction: %d ms",
+                state.position - self._position_at(at_ns),
+            )
         self.state = state
-        self.last_feedback = time.monotonic()
-        c.played_ms = max(0, (state.position or 0) - c.offset_ms)
+        self.state_at_ns = at_ns
+        c.played_ms = max(0, self._position_at(now_ns) - c.offset_ms)
         if state.state == PlayerStateEnum.PLAYING:
             self.output_error = None
-        if (
-            self.last_feedback - self.feedback_sent_at >= 1
-            and state.position is not None
-        ):
-            self.feedback_sent_at = self.last_feedback
-            self._command(
-                "progress", position_ms=state.position, epoch=self.bridge_epoch
-            )
+        self._report_progress(now_ns, force=True)
         self.changed.set()
 
     def _pause_for_output_error(self, message):
@@ -553,11 +591,7 @@ class Service:
             self.awaiting_play = True
             self.handoff_id += 1
             self.suspending = self.handoff_id
-            position = self.state.position if self.state else None
-            if position is None:
-                position = self.offset_ms + (
-                    self.capture.played_ms if self.capture else 0
-                )
+            position = self._position_at(time.monotonic_ns())
             self.pending = None
             self.status = "Paused; press Play in Spotify to resume"
             self.release_task = asyncio.create_task(
