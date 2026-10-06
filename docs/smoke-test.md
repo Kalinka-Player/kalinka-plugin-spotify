@@ -35,6 +35,10 @@ renderer. They were **not run** by the offline test suite.
    previous in both apps. Each discontinuity needs a new URL and valid headers.
    Confirm there is no burst of stale audio and displayed time includes the
    upstream seek position. A seek near the end must not hang indefinitely.
+   Select the third track directly in an album and a playlist, both before
+   playback and while another track is playing. Confirm the selected track
+   starts and Next/Previous follow its position. Record the Spotify client and
+   version used for this check.
 8. Play uninterrupted for several minutes with server snapshot polling removed.
    Spotify progress must advance and no per-second playback-state events should
    reach Kalinka clients. Pause or induce buffering, then resume: the clock must

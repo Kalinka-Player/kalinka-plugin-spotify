@@ -77,6 +77,23 @@ and restart the plugin using Kalinka's settings. The default device name is
 `Kalinka (<hostname>)`, for example `Kalinka (raspberrypi)`. An explicitly configured
 device name takes precedence; output selection stays in Kalinka's renderer selector.
 
+For editable development, keep `executable` pointing directly at this checkout's
+`build/librespot/target/release/librespot`. `pip install -e` installs the Python
+plugin only; it does not build or copy librespot. If your server's development
+configuration already uses `$KALINKA_PREFIX/libexec/librespot`, link that path to
+the build output once, from this repository's root:
+
+```sh
+mkdir -p "${KALINKA_PREFIX:-$HOME/kalinka}/libexec"
+ln -sfn "$PWD/build/librespot/target/release/librespot" \
+  "${KALINKA_PREFIX:-$HOME/kalinka}/libexec/librespot"
+```
+
+After each native rebuild at that path, restart the plugin or restart the
+server's `make dev-run` process to load the new executable. No copy or Python
+reinstallation is needed for binary-only changes. An already running receiver
+continues using the executable it started with until it restarts.
+
 The executable is checked on every start. A stock executable without the
 Kalinka bridge or a build without passthrough fails with a settings error.
 Actual captured bytes must pass Ogg/Vorbis validation before playback starts.
