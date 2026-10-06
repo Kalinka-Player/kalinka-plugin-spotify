@@ -145,6 +145,11 @@ at a nonzero album index while retaining the saved position. Playlist coverage
 also checks both absent and supplied UIDs through context reload, transfer and
 track advancement. A new explicit Play cancels any unfinished previous transfer
 and context resolution, preventing its old context from replacing the new list.
+Bridge Play requests also discard empty `skip_to.track_uri` and
+`skip_to.track_uid` fields before resolving the selection. An empty URI must
+not hide a supplied UID, and an empty UID must not match the first UID-less
+album entry instead of the supplied track index. Nonempty URI/UID selectors
+retain their priority over the index, which some requests supply as zero.
 
 The offline self-test also supports the inherited control socket. It emits
 packet events and waits for credit after every sink write, including the last

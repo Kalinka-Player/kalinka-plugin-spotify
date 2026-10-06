@@ -515,3 +515,45 @@ Upgrade the plugin before deploying the server's polling removal. Older
 plugins require those snapshots. Spotify issue #4 remains separate: capture
 IDs are still used to reject obsolete callbacks, so seeking still changes the
 public track identity.
+
+## Explicit track selection investigation (2026-10-06)
+
+Issue #11 reports that selecting a later album or playlist track starts the
+first. The Pi was running plugin 0.2.1 during this investigation; its bundled
+librespot checksum matched the published ARM64 package. The existing 17 native
+bridge regressions passed, but did not cover empty Play selection identifiers.
+
+Two new offline requests reproduced selection of track zero instead of track
+two: `skip_to` containing `track_uid: ""` with `track_index: 2`, and containing
+`track_uri: ""` with a valid third-track UID and `track_index: 0`. The former
+matched the first UID-less album entry; the latter discarded the valid UID
+and fell back to index zero. Ordinary nonempty URI, UID and index selections
+passed. The user then confirmed that Android always starts the first entry,
+while the web client selects tracks correctly. A read-only stderr trace of
+the Pi's unchanged receiver captured both Android reproductions at 21:44:03
+and 21:44:12 BST. Both logged `Failed to resolve index by Some(Uri("")), using
+fallback index: None` against a 50-track context. This confirms the live
+empty-URI failure path. The raw request and its discarded UID were not logged;
+the synthetic regression also covers a valid UID with no fallback index.
+
+The fix discards empty identifiers only in bridge Play requests.
+Seven selection tests cover these cases, both empty identifiers, normal
+selector precedence, first-track defaults and the resulting previous/next
+queues. All 26 native Connect tests passed on rerun. The first full run hit
+the existing randomized `test_shuffle_with_first` assertion (zero changed
+positions instead of two); no shuffle code was changed. The regenerated patch
+applies to the pristine pinned librespot commit and produces the tested source.
+The trace was detached after the reproduction; the Pi's binary was unchanged.
+The user rebuilt librespot locally. Initial local testing still launched an
+older copy from the development prefix; linking that configured executable to
+the checkout's build output made the rebuilt binary available on restart.
+The user then confirmed that playback selection works. The rebuilt binary
+also passed all four offline pipe-output checks, including seek and credit
+gating. Editable Python installation does not build or install librespot;
+the source-install instructions now document the native development link.
+
+Before opening the PR, all 26 native tests passed again. Python lint, format,
+sdist and wheel checks passed, along with all 166 Python tests against the
+CI-pinned companion core (`ad91659ba259f9dbc195f3618653985116407263`). The newer
+local server checkout requires additional settings-fixture state and caused
+two settings tests to fail; no Python runtime code changed in this fix.

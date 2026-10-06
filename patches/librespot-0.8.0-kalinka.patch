@@ -204,7 +204,7 @@ index ba00aa4..bfceb8a 100644
  mod model;
  mod shuffle_vec;
 diff --git a/connect/src/spirc.rs b/connect/src/spirc.rs
-index 3f9a06f..4e7cc91 100644
+index 3f9a06f..ee78c06 100644
 --- a/connect/src/spirc.rs
 +++ b/connect/src/spirc.rs
 @@ -109,6 +109,11 @@ struct SpircTask {
@@ -381,7 +381,24 @@ index 3f9a06f..4e7cc91 100644
          match request.command {
              // errors and unknown commands
              Transfer(transfer) if transfer.data.is_none() => {
-@@ -1049,7 +1103,7 @@ impl SpircTask {
+@@ -1027,6 +1081,16 @@ impl SpircTask {
+                     .map(Into::into)
+                     .map(LoadContextOptions::Options);
+ 
++                if self.kalinka_bridge {
++                    if let Some(skip_to) = play.options.skip_to.as_mut() {
++                        // Empty identifiers mean no selection by that field.
++                        // Otherwise an empty UID can match the first UID-less
++                        // album entry, or an empty URI can hide a valid UID.
++                        skip_to.track_uri = skip_to.track_uri.take().filter(|s| !s.is_empty());
++                        skip_to.track_uid = skip_to.track_uid.take().filter(|s| !s.is_empty());
++                    }
++                }
++
+                 let fallback_index = play
+                     .options
+                     .skip_to
+@@ -1049,7 +1113,7 @@ impl SpircTask {
                  )
                  .await?;
  
@@ -390,7 +407,7 @@ index 3f9a06f..4e7cc91 100644
              }
              Pause(_) => self.handle_pause(),
              SeekTo(seek_to) => {
-@@ -1078,8 +1132,11 @@ impl SpircTask {
+@@ -1078,8 +1142,11 @@ impl SpircTask {
                      self.handle_shuffle(shuffle)?;
                  }
              }
@@ -404,7 +421,7 @@ index 3f9a06f..4e7cc91 100644
              Resume(_) if matches!(self.play_status, SpircPlayStatus::Stopped) => {
                  self.load_track(true, 0)?
              }
-@@ -1213,6 +1270,7 @@ impl SpircTask {
+@@ -1213,6 +1280,7 @@ impl SpircTask {
      }
  
      async fn handle_disconnect(&mut self) -> Result<(), Error> {
@@ -412,7 +429,7 @@ index 3f9a06f..4e7cc91 100644
          self.context_resolver.clear();
  
          self.play_status = SpircPlayStatus::Stopped {};
-@@ -1228,6 +1286,26 @@ impl SpircTask {
+@@ -1228,6 +1296,26 @@ impl SpircTask {
          Ok(())
      }
  
@@ -439,7 +456,7 @@ index 3f9a06f..4e7cc91 100644
      fn handle_stop(&mut self) {
          self.player.stop();
          self.connect_state.update_position(0, self.now_ms());
-@@ -1273,6 +1351,17 @@ impl SpircTask {
+@@ -1273,6 +1361,17 @@ impl SpircTask {
          page: Option<ContextPage>,
          fallback_index: Option<usize>,
      ) -> Result<(), Error> {
@@ -457,7 +474,7 @@ index 3f9a06f..4e7cc91 100644
          self.connect_state
              .reset_context(if let PlayContext::Uri(ref uri) = cmd.context {
                  ResetContext::WhenDifferent(uri)
-@@ -1361,6 +1450,11 @@ impl SpircTask {
+@@ -1361,6 +1460,11 @@ impl SpircTask {
              self.add_autoplay_resolving_when_required();
          }
  
@@ -469,7 +486,7 @@ index 3f9a06f..4e7cc91 100644
          if self.connect_state.current_track(MessageField::is_some) {
              self.load_track(cmd_options.start_playing, cmd_options.seek_to)?;
          } else {
-@@ -1436,7 +1530,31 @@ impl SpircTask {
+@@ -1436,7 +1540,31 @@ impl SpircTask {
          Ok(())
      }
  
@@ -501,7 +518,7 @@ index 3f9a06f..4e7cc91 100644
          match self.play_status {
              SpircPlayStatus::Paused {
                  position_ms,
-@@ -1507,7 +1625,9 @@ impl SpircTask {
+@@ -1507,7 +1635,9 @@ impl SpircTask {
  
          self.connect_state
              .update_position(position_ms, self.now_ms());
@@ -512,7 +529,7 @@ index 3f9a06f..4e7cc91 100644
          let now = self.now_ms();
          match self.play_status {
              SpircPlayStatus::Stopped => (),
-@@ -1608,16 +1728,38 @@ impl SpircTask {
+@@ -1608,16 +1738,38 @@ impl SpircTask {
          self.context_resolver.add(resolve);
      }
  
@@ -553,7 +570,7 @@ index 3f9a06f..4e7cc91 100644
  
                  let current_uri = self.connect_state.current_track(|t| &t.uri);
                  if matches!(track_uri, Some(ref track_uri) if current_uri != track_uri) {
-@@ -1765,12 +1907,17 @@ impl SpircTask {
+@@ -1765,12 +1917,17 @@ impl SpircTask {
      }
  
      fn load_track(&mut self, start_playing: bool, position_ms: u32) -> Result<(), Error> {
@@ -571,7 +588,7 @@ index 3f9a06f..4e7cc91 100644
          let current_uri = self.connect_state.current_track(|t| &t.uri);
          let id = SpotifyUri::from_uri(current_uri)?;
          self.player.load(id, start_playing, position_ms);
-@@ -1787,7 +1934,75 @@ impl SpircTask {
+@@ -1787,7 +1944,75 @@ impl SpircTask {
          Ok(())
      }
  
@@ -647,7 +664,7 @@ index 3f9a06f..4e7cc91 100644
          self.connect_state.set_status(&self.play_status);
  
          if self.connect_state.is_playing() {
-@@ -1796,7 +2011,6 @@ impl SpircTask {
+@@ -1796,7 +2021,6 @@ impl SpircTask {
          }
  
          self.connect_state.set_now(self.now_ms() as u64);
@@ -655,7 +672,7 @@ index 3f9a06f..4e7cc91 100644
          self.connect_state
              .send_state(&self.session)
              .await
-@@ -1805,7 +2019,10 @@ impl SpircTask {
+@@ -1805,7 +2029,10 @@ impl SpircTask {
  
      fn set_volume(&mut self, volume: u16) {
          debug!("SpircTask::set_volume({volume})");
@@ -666,7 +683,7 @@ index 3f9a06f..4e7cc91 100644
          let old_volume = self.connect_state.device_info().volume;
          let new_volume = volume as u32;
          if old_volume != new_volume || self.mixer.volume() != volume {
-@@ -1816,7 +2033,7 @@ impl SpircTask {
+@@ -1816,7 +2043,7 @@ impl SpircTask {
              if let Some(cache) = self.session.cache() {
                  cache.save_volume(volume)
              }
@@ -675,7 +692,7 @@ index 3f9a06f..4e7cc91 100644
                  self.player.emit_volume_changed_event(volume);
              }
          }
-@@ -1828,3 +2045,489 @@ impl Drop for SpircTask {
+@@ -1828,3 +2055,625 @@ impl Drop for SpircTask {
          debug!("drop Spirc[{}]", self.spirc_id);
      }
  }
@@ -689,6 +706,142 @@ index 3f9a06f..4e7cc91 100644
 +        config::{AudioFormat, PlayerConfig},
 +        mixer::{MixerConfig, softmixer::SoftMixer},
 +    };
++
++    async fn assert_play_selection(
++        skip_to: serde_json::Value,
++        supplied_uids: bool,
++        expected_index: usize,
++    ) {
++        use crate::protocol::context_track::ContextTrack;
++        let (mut task, _events) = offline_task();
++        task.connect_state.preserve_context_uids = true;
++        let context_uri = if supplied_uids {
++            "spotify:playlist:0000000000000000000000"
++        } else {
++            "spotify:album:0000000000000000000000"
++        };
++        let tracks: Vec<ContextTrack> = (0..3)
++            .map(|i| ContextTrack {
++                uri: Some(format!("spotify:local:artist:album:track{i}:180")),
++                uid: supplied_uids.then(|| format!("item-{i}")),
++                ..Default::default()
++            })
++            .collect();
++        // Seed the resolved context to exercise the real Play request path
++        // without Spotify credentials, context fetches or an audio device.
++        task.connect_state
++            .update_context(
++                Context {
++                    uri: Some(context_uri.into()),
++                    pages: vec![ContextPage {
++                        tracks: tracks.clone(),
++                        ..Default::default()
++                    }],
++                    ..Default::default()
++                },
++                ContextType::Default,
++            )
++            .unwrap();
++        let request: Request = serde_json::from_value(serde_json::json!({
++            "message_id": 1,
++            "sent_by_device_id": "test-phone",
++            "command": {
++                "endpoint": "play",
++                "context": {"uri": context_uri},
++                "play_origin": {},
++                "options": {"skip_to": skip_to},
++                "logging_params": {}
++            }
++        }))
++        .unwrap();
++        task.handle_request(request).await.unwrap();
++        assert_eq!(
++            task.connect_state.current_track(|t| t.uri.clone()),
++            tracks[expected_index].uri.clone().unwrap()
++        );
++        assert_eq!(task.connect_state.player().index.track as usize, expected_index);
++        assert_eq!(task.connect_state.player().prev_tracks.len(), expected_index);
++        assert_eq!(task.connect_state.player().next_tracks.len(), 2 - expected_index);
++    }
++
++    #[tokio::test]
++    async fn play_selects_later_album_and_playlist_track_by_index() {
++        for uids in [false, true] {
++            assert_play_selection(serde_json::json!({"track_index": 2}), uids, 2).await;
++        }
++    }
++
++    #[tokio::test]
++    async fn play_selects_later_track_by_uri_before_default_index() {
++        for uids in [false, true] {
++            assert_play_selection(
++                serde_json::json!({
++                    "track_uri": "spotify:local:artist:album:track2:180",
++                    "track_uid": "item-0",
++                    "track_index": 0,
++                }),
++                uids,
++                2,
++            )
++            .await;
++        }
++    }
++
++    #[tokio::test]
++    async fn play_selects_later_track_by_uid_before_default_index() {
++        assert_play_selection(
++            serde_json::json!({"track_uid": "item-2", "track_index": 0}),
++            true,
++            2,
++        )
++        .await;
++    }
++
++    #[tokio::test]
++    async fn play_empty_uid_does_not_match_first_album_track() {
++        assert_play_selection(
++            serde_json::json!({"track_uid": "", "track_index": 2}),
++            false,
++            2,
++        )
++        .await;
++    }
++
++    #[tokio::test]
++    async fn play_empty_uri_does_not_hide_valid_uid() {
++        for index in [serde_json::Value::Null, serde_json::json!(0)] {
++            assert_play_selection(
++                serde_json::json!({"track_uri": "", "track_uid": "item-2", "track_index": index}),
++                true,
++                2,
++            )
++            .await;
++        }
++    }
++
++    #[tokio::test]
++    async fn play_empty_identifiers_fall_back_to_explicit_index() {
++        for uids in [false, true] {
++            assert_play_selection(
++                serde_json::json!({"track_uri": "", "track_uid": "", "track_index": 2}),
++                uids,
++                2,
++            )
++            .await;
++        }
++    }
++
++    #[tokio::test]
++    async fn play_without_selection_still_starts_first_track() {
++        for skip_to in [
++            serde_json::Value::Null,
++            serde_json::json!({}),
++            serde_json::json!({"track_uri": "", "track_uid": ""}),
++            serde_json::json!({"track_uri": "", "track_uid": "", "track_index": 0}),
++        ] {
++            assert_play_selection(skip_to, false, 0).await;
++        }
++    }
 +
 +    async fn freshly_hidden_task(
 +        hidden: &[usize],
