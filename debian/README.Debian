@@ -9,8 +9,8 @@ wheel into its managed environment. The plugin is disabled by default.
 
 Before enabling Spotify:
 
-* Install the matching SDK 3.5, server and renderer streaming support described
-  in docs/core-compatibility.md in the source repository. SDK 3.5 alone is not
+* Install SDK 3.18 and the server and renderer streaming support described
+  in docs/core-compatibility.md in the source repository. The SDK alone is not
   sufficient; the server and renderer must support unfinished HTTP streams.
 * Spotify's executable setting defaults to the bundled librespot. A stock
   librespot executable is incompatible; point the setting elsewhere only at

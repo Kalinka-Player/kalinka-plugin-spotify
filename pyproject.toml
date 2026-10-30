@@ -9,7 +9,7 @@ description = "Spotify Connect compressed-stream input for Kalinka"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
-dependencies = ["kalinka-plugin-sdk>=3.5,<4"]
+dependencies = ["kalinka-plugin-sdk>=3.18,<4"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "httpx", "fastapi", "build", "ruff"]
@@ -19,6 +19,9 @@ kalinka_plugin_spotify = "kalinka_plugin_spotify:KalinkaPluginSpotify"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+kalinka_plugin_spotify = ["icons/*.svg"]
 
 [tool.setuptools_scm]
 tag_regex = "^kalinka-plugin-spotify-v(?P<version>\\d+\\.\\d+\\.\\d+)$"

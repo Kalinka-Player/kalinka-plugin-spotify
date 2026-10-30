@@ -3,7 +3,7 @@ Version: @VERSION@
 Section: python
 Priority: optional
 Architecture: @ARCH@
-Depends: kalinka-server, kalinka-plugin-sdk (>= 3.5), kalinka-plugin-sdk (<< 4), python3 (>= 3.11), ca-certificates, @SHLIBS_DEPENDS@
+Depends: kalinka-server, kalinka-plugin-sdk (>= 3.18), kalinka-plugin-sdk (<< 4), python3 (>= 3.11), ca-certificates, @SHLIBS_DEPENDS@
 Maintainer: Dmitry Savin <envelsavinds@gmail.com>
 Homepage: https://github.com/Kalinka-Player/kalinka-plugin-spotify
 Description: Spotify Connect input for Kalinka Music Player

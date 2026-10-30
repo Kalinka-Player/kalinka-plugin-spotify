@@ -18,10 +18,15 @@ for paced live sources. Finite local/remote file serving still uses
 the existing content path. Stream URLs use Kalinka's existing renderer-reachable
 address binding and access conventions.
 
-CI and release builds use that merged core commit directly through
-`.github/actions/companion-core`. No separate Kalinka core patch is needed.
-For local development, use a KalinkaPlayer checkout containing that commit
-and install its SDK and server:
+The plugin also requires SDK 3.18's packaged artwork API from
+[KalinkaPlayer PR #465](https://github.com/Kalinka-Player/KalinkaPlayer/pull/465).
+It supplies Spotify's monochrome logo in both sizes, with a minimum displayed
+height of 21 logical pixels. The app caches its bitmap conversions.
+
+CI and release builds pin a core commit containing both changes through
+`.github/actions/companion-core`. Merge the artwork SDK before releasing this
+plugin. For local development, use that core checkout and install its SDK
+and server:
 
 ```sh
 python -m pip install -e packages/kalinka-plugin-sdk -e packages/kalinka-server

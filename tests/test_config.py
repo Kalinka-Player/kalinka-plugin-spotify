@@ -32,6 +32,8 @@ def settings_app(tmp_path, config):
     )
     app = FastAPI()
     app.state.schema_version = "test"
+    app.state.page_banners = []
+    app.state.readonly_paths = frozenset()
     app.state.dynamic_field_registry = build_dynamic_field_registry(
         modules.prepared_input_modules, {}
     )
@@ -53,6 +55,10 @@ def test_settings_schema_paths_can_be_enabled_and_survive_restart(tmp_path):
         [module] = page["modules"]
         assert module["id"] == "spotify"
         assert module["title"] == "Spotify Connect"
+        assert module["icons"]["monochrome"] is True
+        for variant in ("small", "standard"):
+            assert module["icons"][variant]["mime_type"] == "image/svg+xml"
+            assert module["icons"][variant]["min_height"] == 21
         assert "renderer selected in Kalinka" in module["description"]
         fields = {f["path"]: f for f in module["fields"]}
         values = client.get("/server/config").json()["values"]

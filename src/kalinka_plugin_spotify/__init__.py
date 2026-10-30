@@ -4,7 +4,7 @@ import socket
 from pathlib import Path
 from typing import ClassVar
 
-from kalinka_plugin_sdk import paths
+from kalinka_plugin_sdk import ModuleIconFiles, paths
 from kalinka_plugin_sdk.datamodel import EmptyList
 from kalinka_plugin_sdk.dynamic_fields import DynamicFieldDecl
 from kalinka_plugin_sdk.inputmodule import ContentInfo, InputModule
@@ -23,6 +23,12 @@ BUNDLED_LIBRESPOT = "/usr/libexec/kalinka-plugin-spotify/librespot"
 class SpotifyConfig(ModuleConfig):
     __module_icon__: ClassVar[str] = "music_note_outlined"
     __module_icon_color__: ClassVar[str] = "#1DB954"
+    __module_icon_files__: ClassVar[ModuleIconFiles] = ModuleIconFiles(
+        small=Path(__file__).with_name("icons") / "spotify.svg",
+        standard=Path(__file__).with_name("icons") / "spotify.svg",
+        monochrome=True,
+        min_height=21,
+    )
 
     name: str = Field(
         default="spotify",
@@ -97,7 +103,7 @@ class SpotifyInput(InputModule):
 
 class KalinkaPluginSpotify(InputModulePlugin):
     PLUGIN_ID = "spotify"
-    REQUIRES_SDK = ">=3.5,<4"
+    REQUIRES_SDK = ">=3.18,<4"
     CONFIG_MODEL = SpotifyConfig
     DYNAMIC_FIELDS: ClassVar[dict[str, DynamicFieldDecl]] = {
         "connect_status": DynamicFieldDecl(
