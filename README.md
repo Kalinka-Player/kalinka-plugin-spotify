@@ -27,7 +27,7 @@ transcode audio, or provide codec support. Kalinka already decodes Ogg/Vorbis.
 
 ## Requirements and installation
 
-Linux, Python 3.11+, a Spotify Premium account, and Kalinka **SDK 3.5 plus the
+Linux, Python 3.11+, a Spotify Premium account, and Kalinka **SDK 3.18 plus the
 matching server and renderer changes** are required. The companion changes add
 unfinished HTTP content and sequential direct playback; see
 [`docs/core-compatibility.md`](docs/core-compatibility.md). An older renderer must
@@ -170,7 +170,7 @@ sudo dnf install ./kalinka-plugin-spotify-*.rpm
 
 The RPM requires `kalinka-server`, which bundles the SDK, plus Python `>=3.11` and CA certificates; rpmbuild adds librespot's library requirements.
 
-The package depends on `kalinka-server`, SDK `>=3.5,<4`, Python `>=3.11` and CA certificates. The companion server and renderer changes are also required; installing this plugin package does not upgrade their streaming implementation.
+The package depends on `kalinka-server`, SDK `>=3.18,<4`, Python `>=3.11` and CA certificates. The companion server and renderer changes are also required; installing this plugin package does not upgrade their streaming implementation.
 
 ### Releasing
 

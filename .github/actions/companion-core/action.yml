@@ -1,12 +1,12 @@
 name: Companion Kalinka core
-description: Check out the pinned Kalinka core with merged SDK 3.5 live-stream support into ./core.
+description: Check out the pinned Kalinka core with SDK 3.18 artwork support into ./core.
 runs:
   using: composite
   steps:
     - uses: actions/checkout@v4
       with:
         repository: Kalinka-Player/KalinkaPlayer
-        # KalinkaPlayer PR #225: SDK, server and renderer live-stream support.
-        ref: ad91659ba259f9dbc195f3618653985116407263
+        # KalinkaPlayer PR #465: packaged small and standard artwork.
+        ref: a3a5ab798a15e8421be5206cca3d0779f0aa6650
         path: core
         fetch-depth: 0

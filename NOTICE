@@ -1,0 +1,10 @@
+Spotify artwork
+---------------
+src/kalinka_plugin_spotify/icons/spotify.svg is the unmodified
+Primary_Logo_Black_RGB.svg from Spotify's official icon download:
+https://developer.spotify.com/documentation/design#using-our-logo
+(retrieved 2026-10-30).
+
+The Spotify logo and trademark belong to Spotify and are not covered by
+this plugin's MIT license. The icon identifies Spotify as the source;
+this integration is not made or endorsed by Spotify.
